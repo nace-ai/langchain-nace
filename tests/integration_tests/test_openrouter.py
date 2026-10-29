@@ -65,14 +65,23 @@ def test_openrouter_errors_are_readable() -> None:
         run("nace-ai/drex-v2.0", refund, key="sk-or-v1-" + "0" * 64)
     with pytest.raises(NaceBadRequestError) as unknown:
         run("nace-ai/drex-v99.9", refund)
-    with pytest.raises(NaceUnprocessableEntityError) as too_many:
-        run("nace-ai/drex-max", {f"q{i}": Noul(instructions=f"mentions {i}?") for i in range(17)})
+    with pytest.raises(NaceUnprocessableEntityError) as too_many_options:
+        run(
+            "nace-ai/drex-max",
+            {
+                "q": {
+                    "type": "choice",
+                    "instructions": "Which label?",
+                    "criteria": {f"label{i}": None for i in range(256)},
+                }
+            },
+        )
     with pytest.raises(NaceBadRequestError) as bad_type:
         run("nace-ai/drex-v2.0", {"q": {"type": "rank", "criteria": ["a"]}})
-    for caught in (bad_key, unknown, too_many, bad_type):
+    for caught in (bad_key, unknown, too_many_options, bad_type):
         print(f"\n{caught.value}")
         assert str(caught.value).startswith("OpenRouter returned")
         assert "HTTP 4" not in str(caught.value)
     assert "does not exist" in str(unknown.value)
-    assert "16" in str(too_many.value)
+    assert "255" in str(too_many_options.value)
     assert "questions.q.type" in str(bad_type.value)

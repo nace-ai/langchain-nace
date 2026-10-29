@@ -47,7 +47,7 @@ All questions about one state go in one request. Answers keep their full probabi
 
 ## Models
 
-The default is **`drex-max`**: it reads images, and takes up to 16 questions per request. For text-only work with more questions per request (up to 512), use `NaceClassifier(model="drex-v2.0")`. Any other model id is accepted and sent as given (`drex-v1.5`, `drex-latest`, and models released later); Drex enforces each model's limits, and errors tell you what to change. Pin a default for your app with `model=` or `NACE_DEFAULT_DECISION_MODEL`. The package default moves to the newest flagship with each Drex release, so pin a model if you need results that never change.
+The default is **`drex-max`**: it reads images, and takes up to 512 questions per request. For text-only work, you can also use `NaceClassifier(model="drex-v2.0")`. Any other model id is accepted and sent as given (`drex-v1.5`, `drex-latest`, and models released later); Drex enforces each model's limits, and errors tell you what to change. Pin a default for your app with `model=` or `NACE_DEFAULT_DECISION_MODEL`. The package default moves to the newest flagship with each Drex release, so pin a model if you need results that never change.
 
 ## Images (Drex Max)
 

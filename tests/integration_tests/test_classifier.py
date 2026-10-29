@@ -158,23 +158,13 @@ def test_max_two_images_in_order(live, request_ids, images: tuple[str, str], exp
     check(r, request_ids, f"max 2 images, red is {expected}", "drex-max")
 
 
-def test_max_more_than_16_questions_refused_with_clear_message(live) -> None:
-    """Drex Max refuses a 17th question with a clear message. The limit is Drex's, not
-    the package's: on a Drex that raises it, all 17 are answered."""
+def test_max_accepts_more_than_16_questions(live) -> None:
+    """The former 16-question cap must not reject valid larger Max requests."""
     questions = {
         f"q{i}": Noul(instructions=f"Does the text mention the number {i}?") for i in range(17)
     }
-    refused: NaceUnprocessableEntityError | None = None
-    try:
-        r = live("drex-max").invoke({"state": TICKET, "questions": questions})
-    except NaceUnprocessableEntityError as e:
-        refused = e
-    if refused is not None:
-        print(f"\n17 questions on drex-max -> {refused}")
-        assert any(str(i.get("path", "")).startswith("questions") for i in refused.issues)
-    else:
-        print("\n17 questions on drex-max -> accepted (Drex raised the limit)")
-        assert set(r.nouls) == set(questions)
+    r = live("drex-max").invoke({"state": TICKET, "questions": questions})
+    assert set(r.nouls) == set(questions)
 
 
 def test_images_with_v2_refused_client_side(live) -> None:

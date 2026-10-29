@@ -106,8 +106,8 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
 
     Args:
         model: Drex model id. Defaults to `NACE_DEFAULT_DECISION_MODEL`, else
-            `drex-max` (reads images; up to 16 questions per request). Use
-            `drex-v2.0` for text-only batches of up to 512 questions.
+            `drex-max` (reads images; up to 512 questions per request).
+            `drex-v2.0` is text-only and has the same question-count limit.
         api_key: `nace_sk_...` key. Defaults to `NACE_API_KEY`.
         base_url: API root. Defaults to `NACE_BASE_URL`, else `https://console.nace.ai`.
             Also works with OpenRouter (`https://openrouter.ai/api`), the Vercel AI
