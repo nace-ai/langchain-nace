@@ -33,7 +33,17 @@ response.scores["mood"].score             # 1.1: expected level
 
 All questions about one state go in one request. Answers keep their full probabilities, so thresholds stay in your code. `ainvoke`, `batch` and `abatch` work as on any Runnable. `batch` runs at most 8 requests at once unless you set `max_concurrency`.
 
-**Switching from `langchain-typesafe`:** change the import to `from langchain_nace import ...` and `TypeSafeClassifier` to `NaceClassifier`. `Noul`, `Choice`, `Score`, `NoulCriteria` and the response fields (`nouls`, `choices`, `scores`, `usage`, `request_id`) have the same names.
+**Switching from `langchain-typesafe`:** change `langchain_typesafe` to `langchain_nace` in your imports, `TypeSafeClassifier` to `NaceClassifier`, and set `NACE_API_KEY`. Everything else keeps its name and arguments:
+
+| `langchain-typesafe` | `langchain-nace` |
+|---|---|
+| `TypeSafeClassifier` | `NaceClassifier` (default model `drex-max`) |
+| `Noul`, `Choice`, `Score`, `NoulCriteria`, `ClassifierRequest`, `ClassifierResponse` | same names; `nouls`, `choices`, `scores`, `usage`, `request_id` as before |
+| `experimental.middleware.ModelRouterMiddleware`, `ModelChoice` | same names (also available as `NaceModelRouterMiddleware`) |
+| `experimental.middleware.AutoModeMiddleware(tools=, instructions=, criteria=)` | same names and arguments (also available as `NaceAutoModeMiddleware`) |
+| `TYPESAFE_API_KEY`, `TYPESAFE_BASE_URL` | `NACE_API_KEY`, `NACE_BASE_URL` |
+| `TypeSafe*Error` | `Nace*Error`; both inherit LangChain's `Model*Error` classes |
+| `client=`, `async_client=` (`httpx2`) | `http_client=`, `http_async_client=` (`httpx`) |
 
 ## Models
 

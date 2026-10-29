@@ -46,6 +46,14 @@ def test_typesafe_names_match() -> None:
     assert typesafe <= set(langchain_nace.__all__)
 
 
+def test_typesafe_middleware_names_match() -> None:
+    from langchain_nace.experimental import middleware
+
+    assert {"AutoModeMiddleware", "ModelChoice", "ModelRouterMiddleware"} <= set(middleware.__all__)
+    assert middleware.AutoModeMiddleware is middleware.NaceAutoModeMiddleware
+    assert middleware.ModelRouterMiddleware is middleware.NaceModelRouterMiddleware
+
+
 def test_every_error_class_is_exported() -> None:
     from langchain_nace import errors
 

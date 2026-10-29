@@ -8,11 +8,12 @@ from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-from langchain_nace import NaceClassifier, NaceOverloadedError
+from langchain_nace import NaceClassifier, NaceOverloadedError, NoulCriteria
 from langchain_nace.experimental.middleware import (
     Allow,
     AskHuman,
     Block,
+    GateQuestions,
     GateVerdict,
     NaceAutoModeMiddleware,
     ThresholdPolicy,
@@ -316,3 +317,58 @@ def test_risk_scales_with_any_rubric_length(classifier: NaceClassifier, drex: Fa
         )
     )
     assert verdict.risk == 1.0
+
+
+def test_typesafe_instructions_and_criteria(classifier: NaceClassifier, drex: FakeDrex) -> None:
+    # The arguments `langchain-typesafe`'s AutoModeMiddleware takes.
+    answers(drex, risk=4, destructive=0.97, matches=0.03)
+    gate = NaceAutoModeMiddleware(
+        model=classifier,
+        tools=[delete_ticket],
+        instructions="Would running `tool_call` be risky?",
+        criteria=NoulCriteria(true="Writes or deletes data.", false="Only reads data."),
+    )
+    result = agent(gate, tool_call("delete_ticket", {"ticket_id": 7}, "c1")).invoke(
+        {"messages": [HumanMessage("Summarize ticket 7")]}
+    )
+    assert calls == []
+    assert "blocked" in last_tool_message(result).content
+    questions = drex.bodies[0]["questions"]
+    assert questions["risk"]["instructions"] == "Would running `tool_call` be risky?"
+    assert questions["risk"]["criteria"] == GateQuestions().risk.criteria
+    assert questions["destructive"]["criteria"] == {
+        "true": "Writes or deletes data.",
+        "false": "Only reads data.",
+    }
+    assert questions["destructive"]["instructions"] == GateQuestions().destructive.instructions
+
+
+def test_questions_with_instructions_or_criteria_is_refused() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        NaceAutoModeMiddleware(questions=GateQuestions(), instructions="Risky?")
+    with pytest.raises(ValueError, match="not both"):
+        NaceAutoModeMiddleware(questions=GateQuestions(), criteria=NoulCriteria(true="x"))
+
+
+def test_typesafe_readme_gate_runs_with_only_the_import_changed(
+    classifier: NaceClassifier, drex: FakeDrex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # langchain-typesafe README, with `langchain_typesafe` replaced by `langchain_nace`.
+    from langchain_nace import NoulCriteria as Criteria
+
+    monkeypatch.setenv("NACE_API_KEY", "nace_sk_test")
+    from langchain_nace.experimental.middleware import AutoModeMiddleware
+
+    answers(drex, risk=4, destructive=0.97, matches=0.03)
+    auto_mode = AutoModeMiddleware(
+        tools=[delete_ticket],
+        criteria=Criteria(
+            true="The call writes, deletes, publishes, or changes access.",
+            false="The call only reads public or user-provided data.",
+        ),
+    )
+    auto_mode.classifier = classifier
+    agent(auto_mode, tool_call("delete_ticket", {"ticket_id": 7}, "c1")).invoke(
+        {"messages": [HumanMessage("Summarize ticket 7")]}
+    )
+    assert calls == []
