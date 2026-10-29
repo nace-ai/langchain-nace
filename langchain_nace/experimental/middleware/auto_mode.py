@@ -39,6 +39,7 @@ from langchain_nace.types import (
     ClassifierResponse,
     ImageLike,
     Noul,
+    NoulCriteria,
     Question,
     Score,
 )
@@ -317,6 +318,10 @@ class NaceAutoModeMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, Re
         model: Drex model id or a configured `NaceClassifier`. Defaults to `drex-max`.
             `screenshots` need an image model such as `drex-max`.
         questions: The questions to ask; see `GateQuestions`.
+        instructions: Shorthand matching `langchain-typesafe`: the wording of the risk
+            question (the default rubric is kept).
+        criteria: Shorthand matching `langchain-typesafe`: what counts as a risky
+            (`true`) or safe (`false`) call, used by the "destructive?" question.
         policy: Turns answers into a decision; see `ThresholdPolicy`.
         on_error: `"block"` the call when Drex fails, or `"raise"` the error.
         recent_messages: How many recent messages to include.
@@ -333,6 +338,8 @@ class NaceAutoModeMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, Re
         tools: Sequence[str | BaseTool] | None = None,
         model: str | NaceClassifier | None = None,
         questions: GateQuestions | None = None,
+        instructions: str | None = None,
+        criteria: NoulCriteria | None = None,
         policy: GatePolicy | None = None,
         on_error: Literal["block", "raise"] = "block",
         recent_messages: int = 20,
@@ -341,10 +348,14 @@ class NaceAutoModeMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, Re
         """Set up the gate.
 
         Raises:
-            ValueError: `screenshots` is set with a model known to read text only.
+            ValueError: `screenshots` is set with a model known to read text only, or
+                `questions` is combined with `instructions` or `criteria`.
 
         """
         super().__init__()
+        if questions is not None and (instructions is not None or criteria is not None):
+            message = "Pass either `questions` or `instructions`/`criteria`, not both."
+            raise ValueError(message)
         if isinstance(model, NaceClassifier):
             self.classifier = model
         else:
@@ -358,7 +369,14 @@ class NaceAutoModeMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, Re
         self.tool_names = (
             None if tools is None else frozenset(t if isinstance(t, str) else t.name for t in tools)
         )
-        self.questions = questions or GateQuestions()
+        self.questions = questions or GateQuestions(
+            risk=DEFAULT_RISK.model_copy(update={"instructions": instructions})
+            if instructions is not None
+            else DEFAULT_RISK,
+            destructive=DEFAULT_DESTRUCTIVE.model_copy(update={"criteria": criteria})
+            if criteria is not None
+            else DEFAULT_DESTRUCTIVE,
+        )
         self.policy: GatePolicy = policy or ThresholdPolicy()
         self.on_error = on_error
         self.recent_messages = recent_messages
