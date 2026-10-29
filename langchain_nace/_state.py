@@ -21,6 +21,19 @@ from langchain_nace.errors import NaceImageModelError, NaceMediaError
 ImageMode = Literal["lift", "placeholder", "error"]
 MediaMode = Literal["placeholder", "error"]
 
+# Roles LangChain accepts in a `{"role", "content"}` dict used in place of a message object.
+_MESSAGE_ROLES = frozenset(
+    {"user", "human", "assistant", "ai", "system", "developer", "tool", "function"}
+)
+
+
+def _is_dict_message(value: dict[str, Any]) -> bool:
+    """A dict message with content blocks; plain-text content needs no conversion."""
+    role = value.get("role")
+    return (
+        isinstance(role, str) and role in _MESSAGE_ROLES and isinstance(value.get("content"), list)
+    )
+
 
 @dataclass
 class _Encoder:
@@ -39,6 +52,8 @@ class _Encoder:
             if not all(isinstance(key, str) for key in value):
                 message = "State object keys must be strings."
                 raise TypeError(message)
+            if _is_dict_message(value):
+                return self.dict_message(value)
             return {key: self.value(item) for key, item in value.items()}
         if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
             return [self.value(item) for item in value]
@@ -46,6 +61,17 @@ class _Encoder:
             return value
         message = f"Unsupported state value: {type(value).__name__}."
         raise TypeError(message)
+
+    def dict_message(self, value: dict[str, Any]) -> dict[str, Any]:
+        # Normalize only the content blocks, as for a message object; the other keys
+        # are the caller's data and stay as they are.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            converted = convert_to_openai_messages({"role": "user", "content": value["content"]})
+        content = self.message(converted)["content"]
+        return {
+            key: content if key == "content" else self.value(item) for key, item in value.items()
+        }
 
     def message(self, message: dict[str, Any]) -> dict[str, Any]:
         content = message.get("content")

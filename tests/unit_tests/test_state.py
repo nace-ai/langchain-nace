@@ -44,6 +44,78 @@ def test_message_images_are_lifted_in_order() -> None:
     assert images == [f"data:image/png;base64,{RED}", f"data:image/png;base64,{BLUE}"]
 
 
+@pytest.mark.parametrize("role", ["user", "human", "assistant", "system"])
+def test_dict_message_images_are_lifted(role: str) -> None:
+    message = {
+        "role": role,
+        "content": [
+            {"type": "text", "text": "compare"},
+            {"type": "image", "base64": RED, "mime_type": "image/png"},
+            {"type": "image", "source_type": "base64", "data": BLUE, "mime_type": "image/png"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{RED}"}},
+        ],
+    }
+    state, images = encode_state([message], images="lift")
+    assert state == [
+        {
+            "role": role,
+            "content": [
+                {"type": "text", "text": "compare"},
+                {"type": "text", "text": "[Image 1]"},
+                {"type": "text", "text": "[Image 2]"},
+                {"type": "text", "text": "[Image 3]"},
+            ],
+        }
+    ]
+    assert images == [
+        f"data:image/png;base64,{RED}",
+        f"data:image/png;base64,{BLUE}",
+        f"data:image/png;base64,{RED}",
+    ]
+
+
+def test_dict_message_keeps_its_other_keys() -> None:
+    message = {
+        "role": "user",
+        "content": [{"type": "image", "base64": RED, "mime_type": "image/png"}],
+        "ts": 1793270000,
+        "meta": {"channel": "email"},
+    }
+    state, images = encode_state({"thread": [message]}, images="lift")
+    assert state == {
+        "thread": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "[Image 1]"}],
+                "ts": 1793270000,
+                "meta": {"channel": "email"},
+            }
+        ]
+    }
+    assert len(images) == 1
+
+
+def test_dict_message_images_on_text_model_raise() -> None:
+    image = {"type": "image", "base64": RED, "mime_type": "image/png"}
+    with pytest.raises(NaceImageModelError, match="drex-max"):
+        encode_state([{"role": "user", "content": [image]}], images="error")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"role": "user", "content": "plain text"},
+        {"role": "admin", "content": [{"type": "image", "base64": "x"}]},
+        {"content": [{"type": "image", "base64": "x"}]},
+    ],
+    ids=["text-content", "unknown-role", "no-role"],
+)
+def test_json_that_is_not_a_multimodal_message_is_unchanged(value: dict) -> None:
+    state, images = encode_state(value, images="lift")
+    assert state == value
+    assert images == []
+
+
 def test_message_images_on_text_model_raise() -> None:
     message = HumanMessage(content=[{"type": "image", "base64": RED, "mime_type": "image/png"}])
     with pytest.raises(NaceImageModelError, match="drex-max"):
