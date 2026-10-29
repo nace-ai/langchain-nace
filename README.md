@@ -1,5 +1,8 @@
 # langchain-nace
 
+[![CI](https://img.shields.io/github/actions/workflow/status/nace-ai/langchain-nace/ci.yml?branch=main&label=CI&logo=github)](https://github.com/nace-ai/langchain-nace/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/nace-ai/langchain-nace/blob/main/LICENSE)
+
 LangChain integration for [Drex](https://console.nace.ai/docs), Nace's decision models. Drex reads text, JSON, LangChain messages and (on Drex Max) images, and returns typed answers with calibrated probabilities instead of generated text. Use it to route requests, pick models, or check tool calls before they run.
 
 ```bash
