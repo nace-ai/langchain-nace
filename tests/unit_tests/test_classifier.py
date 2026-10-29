@@ -1,4 +1,5 @@
 import base64
+import json
 import threading
 from pathlib import Path
 
@@ -195,6 +196,27 @@ def test_message_images_follow_explicit_images(make_classifier, drex: FakeDrex) 
     body = drex.bodies[0]
     assert body["images"] == [RED, f"data:image/png;base64,{BLUE}"]
     assert body["state"]["content"][1] == {"type": "text", "text": "[Image 2]"}
+
+
+def test_dict_message_images_are_sent_as_images(make_classifier, drex: FakeDrex) -> None:
+    make_classifier(model="drex-max").invoke(
+        {
+            "state": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What colour is this?"},
+                        {"type": "image", "base64": RED, "mime_type": "image/png"},
+                    ],
+                }
+            ],
+            "questions": {"q": Noul(instructions="Is Image 1 red?")},
+        }
+    )
+    body = drex.bodies[0]
+    assert body["images"] == [f"data:image/png;base64,{RED}"]
+    assert body["state"][0]["content"][1] == {"type": "text", "text": "[Image 1]"}
+    assert RED not in json.dumps(body["state"])
 
 
 def test_unknown_model_with_images_is_sent(make_classifier, drex: FakeDrex) -> None:

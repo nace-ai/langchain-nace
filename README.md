@@ -51,7 +51,7 @@ max_.invoke({
 })
 ```
 
-Images can be bytes, paths, base64, data URLs, LangChain image blocks (`{"type": "image", "base64": ...}`, `source_type: "base64"`, `image_url`), or files uploaded with `nace_sdk` (`{"type": "workspace_file", ...}`). Images inside LangChain messages in `state` are moved to `images` automatically and referred to as "Image N". Drex doesn't fetch URLs, so remote image URLs are refused. Sending images to a text-only model (`drex-v2.0`, `drex-v1.5`) raises `NaceImageModelError` before anything is sent; images are never dropped silently.
+Images can be bytes, paths, base64, data URLs, LangChain image blocks (`{"type": "image", "base64": ...}`, `source_type: "base64"`, `image_url`), or files uploaded with `nace_sdk` (`{"type": "workspace_file", ...}`). Images inside LangChain messages in `state`, whether message objects or `{"role": ..., "content": [...]}` dicts, are moved to `images` automatically and referred to as "Image N". Drex doesn't fetch URLs, so remote image URLs are refused. Sending images to a text-only model (`drex-v2.0`, `drex-v1.5`) raises `NaceImageModelError` before anything is sent; images are never dropped silently.
 
 ## Routing
 

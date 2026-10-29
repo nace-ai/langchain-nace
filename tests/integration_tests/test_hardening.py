@@ -88,12 +88,13 @@ def test_body_over_4_mib_refused_by_drex(live) -> None:
     ],
     ids=["v1-base64", "v0-source_type", "image_url"],
 )
-def test_langchain_image_blocks_inside_messages(live, request_ids, block) -> None:
-    message = HumanMessage(
-        content=[{"type": "text", "text": "Two pictures:"}, block(BLUE), block(RED)]
-    )
+@pytest.mark.parametrize("as_dict", [False, True], ids=["message", "dict"])
+def test_langchain_image_blocks_inside_messages(live, request_ids, block, as_dict) -> None:
+    content = [{"type": "text", "text": "Two pictures:"}, block(BLUE), block(RED)]
+    message = {"role": "user", "content": content} if as_dict else HumanMessage(content=content)
     r = live("drex-max").invoke({"state": [message], "questions": WHICH_RED})
     assert r.choices["red"].choice == "Image 2"
+    assert r.usage.image_tokens
     request_ids.append(("message image blocks", "drex-max", r.request_id))
 
 
