@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras --all-groups
+      - run: uv run ruff check langchain_nace
+      - run: uv run ruff format --check langchain_nace
+      - run: uv run mypy
+      - run: make check_imports
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --all-extras --all-groups
+      - run: uv run pytest tests/unit_tests --cov
+      - run: uv run pytest tests/integration_tests -m compile
+
+  live:
+    # Contract tests against prod Drex; skipped when the secret isn't available (forks).
+    runs-on: ubuntu-latest
+    needs: test
+    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+    env:
+      NACE_API_KEY_LIVE: ${{ secrets.NACE_API_KEY_LIVE }}
+      NACE_API_KEY: ${{ secrets.NACE_API_KEY_LIVE }}
+      OPENROUTER_API_KEY_LIVE: ${{ secrets.OPENROUTER_API_KEY_LIVE }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras --all-groups
+      - run: uv run pytest tests/integration_tests -s -v
+      - run: make examples

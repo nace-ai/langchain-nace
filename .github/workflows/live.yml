@@ -1,0 +1,26 @@
+name: Live contract (nightly)
+
+# Runs the live suite against prod Drex on the newest LangChain and nace-sdk, so a
+# breaking change upstream shows up before users hit it.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    env:
+      NACE_API_KEY_LIVE: ${{ secrets.NACE_API_KEY_LIVE }}
+      NACE_API_KEY: ${{ secrets.NACE_API_KEY_LIVE }}
+      OPENROUTER_API_KEY_LIVE: ${{ secrets.OPENROUTER_API_KEY_LIVE }}
+      # Real LLMs drive the agent tests (Claude; gpt-oss-120b for the misbehaving-agent test).
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --all-extras --all-groups --upgrade
+      - run: uv run pytest tests/integration_tests -s -v
+      - run: make examples
