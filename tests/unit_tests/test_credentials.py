@@ -342,15 +342,15 @@ async def test_http_to_https_redirect_does_not_forward_auth_or_cookies(
     monkeypatch.setenv("NACE_API_KEY", "nace_sk_FAKE_ONPREM")
     monkeypatch.setenv("NACE_BASE_URL", "http://onprem.customer.test")
     drex.replies.append((307, {"location": "https://onprem.customer.test/v1/systemone"}, {}))
+    # HTTPX rebuilds Cookie on redirects from the client jar, so the jar is what
+    # the origin guard must strip.
     with httpx.Client(transport=drex.transport(), follow_redirects=True) as sync_client:
+        sync_client.cookies.set("session", "FAKE", domain="onprem.customer.test")
         async with httpx.AsyncClient(
             transport=drex.async_transport(), follow_redirects=True
         ) as async_client:
-            classifier = NaceClassifier(
-                default_headers={"Cookie": "session=FAKE"},
-                http_client=sync_client,
-                http_async_client=async_client,
-            )
+            async_client.cookies.set("session", "FAKE", domain="onprem.customer.test")
+            classifier = NaceClassifier(http_client=sync_client, http_async_client=async_client)
             if async_call:
                 await classifier.ainvoke(CALL)
             else:
@@ -360,6 +360,77 @@ async def test_http_to_https_redirect_does_not_forward_auth_or_cookies(
     assert first.headers["cookie"] == "session=FAKE"
     assert "authorization" not in redirected.headers
     assert "cookie" not in redirected.headers
+
+
+@pytest.mark.parametrize("async_call", [False, True])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://console.nace.ai",
+        "https://console.nace.ai:8443",
+        "https://evil.nace.ai",
+        "https://console.nace.ai.evil.test",
+    ],
+)
+async def test_bypass_headers_only_go_to_exact_nace_https_origins(
+    monkeypatch, drex, url, async_call
+):
+    monkeypatch.setenv("NACE_VERCEL_PROTECTION_BYPASS", "FAKE_BYPASS_TOKEN")
+    classifier = NaceClassifier(
+        api_key="sk-explicit-test",
+        base_url=url,
+        default_headers={"X-Vercel-Set-Bypass-Cookie": "true"},
+        http_client=httpx.Client(transport=drex.transport()),
+        http_async_client=httpx.AsyncClient(transport=drex.async_transport()),
+    )
+    if async_call:
+        await classifier.ainvoke(CALL)
+    else:
+        classifier.invoke(CALL)
+    headers = drex.requests[0].headers
+    assert "x-vercel-protection-bypass" not in headers
+    assert "x-vercel-set-bypass-cookie" not in headers
+
+
+@pytest.mark.parametrize("host", ["console.nace.ai.", "CONSOLE.NACE.AI", "drex.stage.nace.ai:443"])
+def test_trusted_host_variants_keep_bypass_header(monkeypatch, drex, host):
+    monkeypatch.setenv("NACE_VERCEL_PROTECTION_BYPASS", "FAKE_BYPASS_TOKEN")
+    classifier = NaceClassifier(
+        api_key="sk-explicit-test",
+        base_url=f"https://{host}",
+        http_client=httpx.Client(transport=drex.transport()),
+    )
+    classifier.invoke(CALL)
+    assert drex.requests[0].headers["x-vercel-protection-bypass"] == "FAKE_BYPASS_TOKEN"
+
+
+def test_blank_openrouter_key_is_rejected(monkeypatch, drex):
+    monkeypatch.setenv("NACE_API_KEY", "nace_sk_FAKE_FOR_TEST")
+    monkeypatch.setenv("OPENROUTER_API_KEY", " ")
+    with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+        NaceClassifier(
+            base_url="https://openrouter.ai/api/v1",
+            http_client=httpx.Client(transport=drex.transport()),
+        )
+    assert drex.requests == []
+
+
+def test_openrouter_host_with_format_disabled_still_needs_openrouter_key(monkeypatch, drex):
+    monkeypatch.setenv("NACE_API_KEY", "nace_sk_FAKE_FOR_TEST")
+    with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+        NaceClassifier(
+            base_url="https://openrouter.ai/api/v1",
+            openrouter=False,
+            http_client=httpx.Client(transport=drex.transport()),
+        )
+    classifier = NaceClassifier(
+        api_key="sk-or-explicit-test",
+        base_url="https://openrouter.ai/api/v1",
+        openrouter=False,
+        http_client=httpx.Client(transport=drex.transport()),
+    )
+    assert dumpd(classifier)["kwargs"]["api_key"]["id"] == ["OPENROUTER_API_KEY"]
+    assert drex.requests == []
 
 
 def test_configurable_base_url_does_not_carry_environment_key(monkeypatch, drex):
