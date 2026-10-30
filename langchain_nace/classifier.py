@@ -194,9 +194,12 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
 
     @override
     def model_post_init(self, context: Any, /) -> None:
+        env_key: SecretStr | None = None
         if _is_nace_destination(self.base_url):
+            # Keep the ambient key out of the public `api_key` field: LangChain rebuilds
+            # configurable models from the fields, which would make it look explicit.
             if self.api_key is None:
-                self.api_key = secret_from_env("NACE_API_KEY", default=None)()
+                env_key = secret_from_env("NACE_API_KEY", default=None)()
         elif self.api_key is None or not self.api_key.get_secret_value().strip():
             message = "A custom base_url requires an explicit api_key for that provider."
             raise ValueError(message)
@@ -209,7 +212,10 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         # attempt and `max_retries` their number, so the budget is disabled, as in
         # deepset's typesafe-haystack and nace-haystack.
         retry = nace_sdk.RetryPolicy(max_retries=self.max_retries, timeout=None)
-        key = self.api_key.get_secret_value() if self.api_key is not None else None
+        # `SecretStr("")` is falsy; an explicit empty key must reach the SDK as "" (which
+        # it rejects) rather than become None and fall back to the SDK's own env lookup.
+        secret = self.api_key if self.api_key is not None else env_key
+        key = secret.get_secret_value() if secret is not None else None
         sync_http = self.http_client or httpx.Client(timeout=self.timeout)
         if _set_user_agent not in sync_http.event_hooks["request"]:
             sync_http.event_hooks["request"].append(_set_user_agent)

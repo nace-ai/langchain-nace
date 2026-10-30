@@ -93,6 +93,14 @@ def test_blank_explicit_key_on_custom_host_is_rejected(monkeypatch, drex, key):
         )
 
 
+def test_empty_explicit_key_on_nace_host_does_not_fall_back_to_env(monkeypatch, drex):
+    monkeypatch.setenv("NACE_API_KEY", "nace_sk_FAKE_FOR_TEST")
+    monkeypatch.setenv("DREX_API_KEY", "nace_sk_FAKE_LEGACY_FOR_TEST")
+    with pytest.raises(ValueError, match=r"(?i)api key"):
+        NaceClassifier(api_key="", http_client=httpx.Client(transport=drex.transport()))
+    assert drex.requests == []
+
+
 def test_unset_base_url_is_sent_explicitly(monkeypatch, drex):
     monkeypatch.setenv("DREX_BASE_URL", "https://evil.test")
     monkeypatch.setenv("NACE_API_KEY", "nace_sk_FAKE_FOR_TEST")
@@ -210,3 +218,18 @@ async def test_redirect_to_custom_host_does_not_forward_credentials(monkeypatch,
     assert "authorization" not in redirected.headers
     assert "x-vercel-protection-bypass" not in redirected.headers
     assert "x-vercel-set-bypass-cookie" not in redirected.headers
+
+
+def test_configurable_base_url_does_not_carry_environment_key(monkeypatch, drex):
+    from langchain_core.runnables import ConfigurableField
+
+    monkeypatch.setenv("NACE_API_KEY", "nace_sk_FAKE_FOR_TEST")
+    classifier = NaceClassifier(
+        http_client=httpx.Client(transport=drex.transport()),
+        http_async_client=httpx.AsyncClient(transport=drex.async_transport()),
+    )
+    assert classifier.api_key is None
+    configurable = classifier.configurable_fields(base_url=ConfigurableField(id="base_url"))
+    with pytest.raises(ValueError, match="explicit api_key"):
+        configurable.invoke(CALL, {"configurable": {"base_url": "https://openrouter.ai/api/v1"}})
+    assert not drex.requests
