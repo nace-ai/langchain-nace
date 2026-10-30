@@ -33,6 +33,25 @@ DEFAULT_MODEL = "drex-max"
 CLIENT_NAME = f"langchain-nace/{__version__}"
 MIN_TIMEOUT = 60.0
 DEFAULT_MAX_CONCURRENCY = 8
+DEFAULT_BASE_URL = "https://console.nace.ai"
+NACE_HOSTS = frozenset(
+    {
+        "console.nace.ai",
+        "drex.nace.ai",
+    }
+)
+
+
+def _is_nace_destination(base_url: str | None) -> bool:
+    url = urlsplit(base_url or DEFAULT_BASE_URL)
+    return (
+        url.scheme == "https"
+        and (url.hostname or "").removesuffix(".") in NACE_HOSTS
+        and url.port in (None, 443)
+        and url.username is None
+        and url.password is None
+    )
+
 
 # Facts about released, pinned versions never change, so this list can't go stale.
 # Every other model id (new releases, aliases such as drex-latest) is sent as given
@@ -46,11 +65,18 @@ def is_text_only(model: str) -> bool:
 
 
 def _is_openrouter(base_url: str | None) -> bool:
-    return bool(base_url) and (urlsplit(str(base_url)).hostname or "").endswith("openrouter.ai")
+    if not base_url:
+        return False
+    return (urlsplit(base_url).hostname or "").removesuffix(".") == "openrouter.ai"
 
 
 def _set_user_agent(request: httpx.Request) -> None:
     request.headers["User-Agent"] = CLIENT_NAME
+    # Check the final request URL, including redirected requests and custom clients.
+    # Older nace-sdk versions add this environment token for every destination.
+    if not _is_nace_destination(str(request.url)):
+        request.headers.pop("x-vercel-protection-bypass", None)
+        request.headers.pop("x-vercel-set-bypass-cookie", None)
 
 
 async def _aset_user_agent(request: httpx.Request) -> None:
@@ -108,7 +134,8 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         model: Drex model id. Defaults to `NACE_DEFAULT_DECISION_MODEL`, else
             `drex-max` (reads images; up to 16 questions per request). Use
             `drex-v2.0` for text-only batches of up to 512 questions.
-        api_key: `nace_sk_...` key. Defaults to `NACE_API_KEY`.
+        api_key: Provider key. Defaults to `NACE_API_KEY` only for Nace HTTPS hosts.
+            Other hosts require an explicit key belonging to that provider.
         base_url: API root. Defaults to `NACE_BASE_URL`, else `https://console.nace.ai`.
             Also works with OpenRouter (`https://openrouter.ai/api`), the Vercel AI
             Gateway (`.../typesafe`) and other TypeSafe-compatible hosts.
@@ -124,7 +151,7 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         min_length=1,
     )
     api_key: SecretStr | None = Field(
-        default_factory=secret_from_env("NACE_API_KEY", default=None),
+        default=None,
         exclude=True,
         repr=False,
     )
@@ -163,6 +190,15 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
 
     @override
     def model_post_init(self, context: Any, /) -> None:
+        env_key: SecretStr | None = None
+        if _is_nace_destination(self.base_url):
+            # Keep the ambient key out of the public `api_key` field: LangChain rebuilds
+            # configurable models from the fields, which would make it look explicit.
+            if self.api_key is None:
+                env_key = secret_from_env("NACE_API_KEY", default=None)()
+        elif self.api_key is None or not self.api_key.get_secret_value().strip():
+            message = "A custom base_url requires an explicit api_key for that provider."
+            raise ValueError(message)
         headers = dict(self.default_headers or {})
         if self._openrouter:
             headers.setdefault("HTTP-Referer", "https://nace.ai")
@@ -172,7 +208,10 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         # attempt and `max_retries` their number, so the budget is disabled, as in
         # deepset's typesafe-haystack and nace-haystack.
         retry = nace_sdk.RetryPolicy(max_retries=self.max_retries, timeout=None)
-        key = self.api_key.get_secret_value() if self.api_key else None
+        # `SecretStr("")` is falsy; an explicit empty key must reach the SDK as "" (which
+        # it rejects) rather than become None and fall back to the SDK's own env lookup.
+        secret = self.api_key if self.api_key is not None else env_key
+        key = secret.get_secret_value() if secret is not None else None
         sync_http = self.http_client or httpx.Client(timeout=self.timeout)
         if _set_user_agent not in sync_http.event_hooks["request"]:
             sync_http.event_hooks["request"].append(_set_user_agent)
@@ -206,7 +245,9 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         if self.base_url and self._openrouter:
             # OpenRouter documents `.../api/v1`; the SDK appends `/v1/systemone` itself.
             return self.base_url.rstrip("/").removesuffix("/v1")
-        return self.base_url
+        # Send the destination that was checked, so the SDK cannot resolve another
+        # one from its own environment variables.
+        return self.base_url or DEFAULT_BASE_URL
 
     @classmethod
     @override
@@ -220,8 +261,23 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
 
     @property
     @override
+    def lc_attributes(self) -> dict[str, Any]:
+        # Always record the destination, so a reload cannot pair the saved secret
+        # name with a different base_url taken from the reload environment.
+        return {"base_url": self.base_url or DEFAULT_BASE_URL}
+
+    @property
+    @override
     def lc_secrets(self) -> dict[str, str]:
-        return {"api_key": "NACE_API_KEY"}
+        if _is_nace_destination(self.base_url):
+            return {"api_key": "NACE_API_KEY"}
+        # Reloading a serialized custom provider must never substitute a Nace key, and
+        # the secret follows the destination, not the `openrouter` request-format override.
+        return {
+            "api_key": "OPENROUTER_API_KEY"
+            if _is_openrouter(self.base_url)
+            else "NACE_CUSTOM_API_KEY"
+        }
 
     @override
     def invoke(
