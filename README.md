@@ -15,25 +15,29 @@ from langchain_nace import Choice, NaceClassifier, Noul, Score
 
 classifier = NaceClassifier()  # model="drex-max" by default
 
-response = classifier.invoke({
-    "state": "I was charged twice for March and I'm annoyed. Please refund one.",
-    "questions": {
-        "refund": Noul(instructions="Is the customer asking for a refund?"),
-        "team": Choice(
-            instructions="Which team should handle this?",
-            criteria={"billing": "Payments and refunds", "technical": "Bugs"},
-        ),
-        "mood": Score(instructions="How upset is the customer?", criteria=["calm", "annoyed", "furious"]),
-    },
-})
-response.nouls["refund"].noul             # 0.98: probability of yes
-response.choices["team"].probabilities    # {"billing": 0.99, "technical": 0.01}
-response.scores["mood"].score             # 1.1: expected level
+response = classifier.invoke(
+    {
+        "state": "I was charged twice for March and I'm annoyed. Please refund one.",
+        "questions": {
+            "refund": Noul(instructions="Is the customer asking for a refund?"),
+            "team": Choice(
+                instructions="Which team should handle this?",
+                criteria={"billing": "Payments and refunds", "technical": "Bugs"},
+            ),
+            "mood": Score(
+                instructions="How upset is the customer?", criteria=["calm", "annoyed", "furious"]
+            ),
+        },
+    }
+)
+response.nouls["refund"].noul  # 0.98: probability of yes
+response.choices["team"].probabilities  # {"billing": 0.99, "technical": 0.01}
+response.scores["mood"].score  # 1.1: expected level
 ```
 
 All questions about one state go in one request. Answers keep their full probabilities, so thresholds stay in your code. `ainvoke`, `batch` and `abatch` work as on any Runnable. `batch` runs at most 8 requests at once unless you set `max_concurrency`.
 
-**Switching from `langchain-typesafe`:** change `langchain_typesafe` to `langchain_nace` in your imports, `TypeSafeClassifier` to `NaceClassifier`, and set `NACE_API_KEY`. Everything else keeps its name and arguments:
+**Switching from `langchain-typesafe`:** change `langchain_typesafe` to `langchain_nace` in your imports, `TypeSafeClassifier` to `NaceClassifier`, and set `NACE_API_KEY` (used only for the Nace hosts listed under Backends; for any other `base_url`, pass that provider's key as `api_key=`). Everything else keeps its name and arguments:
 
 | `langchain-typesafe` | `langchain-nace` |
 |---|---|
@@ -53,12 +57,18 @@ The default is **`drex-max`**: it reads images, and takes up to 16 questions per
 
 ```python
 max_ = NaceClassifier()  # drex-max
-max_.invoke({
-    "state": "Two product photos.",
-    "images": [red_png_bytes, "data:image/jpeg;base64,..."],
-    "questions": {"damaged": Choice(instructions="Which image shows damage?",
-                                    criteria={"Image 1": None, "Image 2": None})},
-})
+max_.invoke(
+    {
+        "state": "Two product photos.",
+        "images": [red_png_bytes, "data:image/jpeg;base64,..."],
+        "questions": {
+            "damaged": Choice(
+                instructions="Which image shows damage?",
+                criteria={"Image 1": None, "Image 2": None},
+            )
+        },
+    }
+)
 ```
 
 Images can be bytes, paths, base64, data URLs, LangChain image blocks (`{"type": "image", "base64": ...}`, `source_type: "base64"`, `image_url`), or files uploaded with `nace_sdk` (`{"type": "workspace_file", ...}`). Images inside LangChain messages in `state`, whether message objects or `{"role": ..., "content": [...]}` dicts, are moved to `images` automatically and referred to as "Image N". Drex doesn't fetch URLs, so remote image URLs are refused. Sending images to a text-only model (`drex-v2.0`, `drex-v1.5`) raises `NaceImageModelError` before anything is sent; images are never dropped silently.
@@ -68,11 +78,15 @@ Images can be bytes, paths, base64, data URLs, LangChain image blocks (`{"type":
 ```python
 from langchain_nace import NaceRouter
 
-router = NaceRouter(classifier=classifier, question=Choice(
-    instructions="Which team?", criteria={"billing": None, "technical": None}),
-    min_confidence=0.6, fallback="human")
-chain = router.branch({"billing": billing_chain, "technical": tech_chain, "human": escalate},
-                      default=escalate)
+router = NaceRouter(
+    classifier=classifier,
+    question=Choice(instructions="Which team?", criteria={"billing": None, "technical": None}),
+    min_confidence=0.6,
+    fallback="human",
+)
+chain = router.branch(
+    {"billing": billing_chain, "technical": tech_chain, "human": escalate}, default=escalate
+)
 ```
 
 LangGraph: `nace_conditional_edge(classifier, question, state=..., min_confidence=0.7)` is a path function for `add_conditional_edges`. Below the threshold it returns `"human_review"`, so that node can `interrupt()` for a person. See [`examples/langgraph_router.py`](https://github.com/nace-ai/langchain-nace/blob/main/examples/langgraph_router.py).
@@ -83,16 +97,22 @@ LangGraph: `nace_conditional_edge(classifier, question, state=..., min_confidenc
 from langchain.agents import create_agent
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_nace.experimental.middleware import (
-    ModelChoice, NaceAutoModeMiddleware, NaceModelRouterMiddleware)
+    ModelChoice,
+    NaceAutoModeMiddleware,
+    NaceModelRouterMiddleware,
+)
 
 router = NaceModelRouterMiddleware(
-    choices={"fast": ModelChoice("openai:gpt-5-mini", "Short lookups"),
-             "strong": ModelChoice("anthropic:claude-opus-5-5", "Multi-step changes")},
+    choices={
+        "fast": ModelChoice("openai:gpt-5-mini", "Short lookups"),
+        "strong": ModelChoice("anthropic:claude-opus-5-5", "Multi-step changes"),
+    },
     instructions="Pick the cheapest model that can do this safely.",
 )
 gate = NaceAutoModeMiddleware(screenshots=True)  # drex-max reads the screenshots
-agent = create_agent("openai:gpt-5-mini", tools=tools, middleware=[router, gate],
-                     checkpointer=InMemorySaver())
+agent = create_agent(
+    "openai:gpt-5-mini", tools=tools, middleware=[router, gate], checkpointer=InMemorySaver()
+)
 ```
 
 **`NaceModelRouterMiddleware`** picks the model once per run. Below `min_confidence` (0.6), or if Drex can't be reached, it uses `escalate_to` (the last choice by default). The decision and probabilities are kept in state under `nace_model_route`.
@@ -134,6 +154,8 @@ classifier = NaceClassifier(
 )
 ```
 
+Without an explicit `api_key`, a custom `base_url` or `NACE_BASE_URL` raises `ValueError` when the classifier is created. This includes the default classifier built by `NaceRouter`, `nace_conditional_edge` and the middleware, so pass `classifier=NaceClassifier(base_url=..., api_key=...)` for custom hosts.
+
 Vercel bypass headers are removed from requests to other destinations, even
 when an older `nace-sdk` adds `NACE_VERCEL_PROTECTION_BYPASS` automatically.
 Serialized custom-provider classifiers refer to `OPENROUTER_API_KEY` for
@@ -144,6 +166,13 @@ explicit key was supplied, and could send a Vercel bypass token even with an
 explicit provider key. Upgrade to 0.1.3 or later. If you used that configuration
 with real credentials, replace and revoke those credentials; upgrading does not
 revoke them or remove copies held by another provider.
+
+Custom-provider classifiers serialized by 0.1.0–0.1.2 may still reference
+`NACE_API_KEY`. Recreate those classifiers with 0.1.3 or later using the correct
+provider key, then serialize them again. Do not reload an old custom-provider
+manifest with your Nace key supplied through `secrets_map` or
+`secrets_from_env=True`. Upgrading the package cannot change secret references
+already stored in older manifests.
 
 ## Errors
 

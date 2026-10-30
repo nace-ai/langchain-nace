@@ -33,6 +33,7 @@ DEFAULT_MODEL = "drex-max"
 CLIENT_NAME = f"langchain-nace/{__version__}"
 MIN_TIMEOUT = 60.0
 DEFAULT_MAX_CONCURRENCY = 8
+DEFAULT_BASE_URL = "https://console.nace.ai"
 NACE_HOSTS = frozenset(
     {
         "console.nace.ai",
@@ -46,7 +47,7 @@ NACE_HOSTS = frozenset(
 
 
 def _is_nace_destination(base_url: str | None) -> bool:
-    url = urlsplit(base_url or "https://console.nace.ai")
+    url = urlsplit(base_url or DEFAULT_BASE_URL)
     return (
         url.scheme == "https"
         and (url.hostname or "").removesuffix(".") in NACE_HOSTS
@@ -196,7 +197,7 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         if _is_nace_destination(self.base_url):
             if self.api_key is None:
                 self.api_key = secret_from_env("NACE_API_KEY", default=None)()
-        elif self.api_key is None:
+        elif self.api_key is None or not self.api_key.get_secret_value().strip():
             message = "A custom base_url requires an explicit api_key for that provider."
             raise ValueError(message)
         headers = dict(self.default_headers or {})
@@ -208,7 +209,7 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         # attempt and `max_retries` their number, so the budget is disabled, as in
         # deepset's typesafe-haystack and nace-haystack.
         retry = nace_sdk.RetryPolicy(max_retries=self.max_retries, timeout=None)
-        key = self.api_key.get_secret_value() if self.api_key else None
+        key = self.api_key.get_secret_value() if self.api_key is not None else None
         sync_http = self.http_client or httpx.Client(timeout=self.timeout)
         if _set_user_agent not in sync_http.event_hooks["request"]:
             sync_http.event_hooks["request"].append(_set_user_agent)
@@ -242,7 +243,9 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         if self.base_url and self._openrouter:
             # OpenRouter documents `.../api/v1`; the SDK appends `/v1/systemone` itself.
             return self.base_url.rstrip("/").removesuffix("/v1")
-        return self.base_url
+        # Send the destination that was checked, so the SDK cannot resolve another
+        # one from its own environment variables.
+        return self.base_url or DEFAULT_BASE_URL
 
     @classmethod
     @override
@@ -253,6 +256,13 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
     @override
     def get_lc_namespace(cls) -> list[str]:
         return ["langchain", "classifiers", "nace"]
+
+    @property
+    @override
+    def lc_attributes(self) -> dict[str, Any]:
+        # Always record the destination, so a reload cannot pair the saved secret
+        # name with a different base_url taken from the reload environment.
+        return {"base_url": self.base_url or DEFAULT_BASE_URL}
 
     @property
     @override
