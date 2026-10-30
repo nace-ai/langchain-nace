@@ -122,6 +122,29 @@ Asking uses a LangGraph `interrupt`. Resume it with `{"type": "approve"}`, `{"ty
 
 Every request sends `User-Agent` and `X-Nace-Client: langchain-nace/<version>`. On OpenRouter it also sends `HTTP-Referer` and `X-OpenRouter-Title`.
 
+`NACE_API_KEY` is used automatically only over HTTPS on port 443 at
+`console.nace.ai`, `console.test.nace.ai`, `console.stage.nace.ai` and their
+legacy `drex` equivalents. Other destinations, including localhost, require
+an explicit provider key:
+
+```python
+classifier = NaceClassifier(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ["OPENROUTER_API_KEY"],
+)
+```
+
+Vercel bypass headers are removed from requests to other destinations, even
+when an older `nace-sdk` adds `NACE_VERCEL_PROTECTION_BYPASS` automatically.
+Serialized custom-provider classifiers refer to `OPENROUTER_API_KEY` for
+OpenRouter, or `NACE_CUSTOM_API_KEY` for other hosts, instead of `NACE_API_KEY`.
+
+Versions 0.1.0–0.1.2 could send `NACE_API_KEY` to a custom `base_url` when no
+explicit key was supplied, and could send a Vercel bypass token even with an
+explicit provider key. Upgrade to 0.1.3 or later. If you used that configuration
+with real credentials, replace and revoke those credentials; upgrading does not
+revoke them or remove copies held by another provider.
+
 ## Errors
 
 Errors also inherit LangChain's `Model*Error` classes, and messages never include your state:

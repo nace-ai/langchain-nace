@@ -33,6 +33,28 @@ DEFAULT_MODEL = "drex-max"
 CLIENT_NAME = f"langchain-nace/{__version__}"
 MIN_TIMEOUT = 60.0
 DEFAULT_MAX_CONCURRENCY = 8
+NACE_HOSTS = frozenset(
+    {
+        "console.nace.ai",
+        "console.test.nace.ai",
+        "console.stage.nace.ai",
+        "drex.nace.ai",
+        "drex.test.nace.ai",
+        "drex.stage.nace.ai",
+    }
+)
+
+
+def _is_nace_destination(base_url: str | None) -> bool:
+    url = urlsplit(base_url or "https://console.nace.ai")
+    return (
+        url.scheme == "https"
+        and (url.hostname or "").removesuffix(".") in NACE_HOSTS
+        and url.port in (None, 443)
+        and url.username is None
+        and url.password is None
+    )
+
 
 # Facts about released, pinned versions never change, so this list can't go stale.
 # Every other model id (new releases, aliases such as drex-latest) is sent as given
@@ -46,11 +68,18 @@ def is_text_only(model: str) -> bool:
 
 
 def _is_openrouter(base_url: str | None) -> bool:
-    return bool(base_url) and (urlsplit(str(base_url)).hostname or "").endswith("openrouter.ai")
+    if not base_url:
+        return False
+    return (urlsplit(base_url).hostname or "").removesuffix(".") == "openrouter.ai"
 
 
 def _set_user_agent(request: httpx.Request) -> None:
     request.headers["User-Agent"] = CLIENT_NAME
+    # Check the final request URL, including redirected requests and custom clients.
+    # Older nace-sdk versions add this environment token for every destination.
+    if not _is_nace_destination(str(request.url)):
+        request.headers.pop("x-vercel-protection-bypass", None)
+        request.headers.pop("x-vercel-set-bypass-cookie", None)
 
 
 async def _aset_user_agent(request: httpx.Request) -> None:
@@ -108,7 +137,8 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         model: Drex model id. Defaults to `NACE_DEFAULT_DECISION_MODEL`, else
             `drex-max` (reads images; up to 16 questions per request). Use
             `drex-v2.0` for text-only batches of up to 512 questions.
-        api_key: `nace_sk_...` key. Defaults to `NACE_API_KEY`.
+        api_key: Provider key. Defaults to `NACE_API_KEY` only for Nace HTTPS hosts.
+            Other hosts require an explicit key belonging to that provider.
         base_url: API root. Defaults to `NACE_BASE_URL`, else `https://console.nace.ai`.
             Also works with OpenRouter (`https://openrouter.ai/api`), the Vercel AI
             Gateway (`.../typesafe`) and other TypeSafe-compatible hosts.
@@ -124,7 +154,7 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         min_length=1,
     )
     api_key: SecretStr | None = Field(
-        default_factory=secret_from_env("NACE_API_KEY", default=None),
+        default=None,
         exclude=True,
         repr=False,
     )
@@ -163,6 +193,12 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
 
     @override
     def model_post_init(self, context: Any, /) -> None:
+        if _is_nace_destination(self.base_url):
+            if self.api_key is None:
+                self.api_key = secret_from_env("NACE_API_KEY", default=None)()
+        elif self.api_key is None:
+            message = "A custom base_url requires an explicit api_key for that provider."
+            raise ValueError(message)
         headers = dict(self.default_headers or {})
         if self._openrouter:
             headers.setdefault("HTTP-Referer", "https://nace.ai")
@@ -221,7 +257,10 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
     @property
     @override
     def lc_secrets(self) -> dict[str, str]:
-        return {"api_key": "NACE_API_KEY"}
+        if _is_nace_destination(self.base_url):
+            return {"api_key": "NACE_API_KEY"}
+        # Reloading a serialized custom provider must never substitute a Nace key.
+        return {"api_key": "OPENROUTER_API_KEY" if self._openrouter else "NACE_CUSTOM_API_KEY"}
 
     @override
     def invoke(
