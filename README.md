@@ -1,17 +1,7 @@
 <p align="center">
-  <a href="https://nace.ai">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://console.nace.ai/brand/nace-logo-white.svg">
-      <img src="https://console.nace.ai/brand/nace-logo-black.svg" alt="Nace" height="40">
-    </picture>
-  </a>
+  <a href="https://nace.ai"><picture><source media="(prefers-color-scheme: dark)" srcset="https://console.nace.ai/brand/nace-logo-white.svg"><img src="https://console.nace.ai/brand/nace-logo-black.svg" alt="Nace" height="40"></picture></a>
   &nbsp;&nbsp;&nbsp;
-  <a href="https://www.langchain.com/langchain">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://cdn.prod.website-files.com/65b8cd72835ceeacd4449a53/6a9942640271f297cc0bd30b_LangChain_OSS%20Lockup_light%201-1.svg">
-      <img src="https://cdn.prod.website-files.com/65b8cd72835ceeacd4449a53/6a994264a64b3afcdd880f66_LangChain_OSS%20Lockup_light%201.svg" alt="LangChain" height="40">
-    </picture>
-  </a>
+  <a href="https://www.langchain.com/langchain"><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.prod.website-files.com/65b8cd72835ceeacd4449a53/6a9942640271f297cc0bd30b_LangChain_OSS%20Lockup_light%201-1.svg"><img src="https://cdn.prod.website-files.com/65b8cd72835ceeacd4449a53/6a994264a64b3afcdd880f66_LangChain_OSS%20Lockup_light%201.svg" alt="LangChain" height="40"></picture></a>
 </p>
 
 <h1 align="center">Drex for LangChain</h1>
