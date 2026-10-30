@@ -159,7 +159,7 @@ def test_openrouter_format_override_on_custom_host_keeps_custom_secret(monkeypat
     assert drex.requests[0].headers["authorization"] == "Bearer sk-gateway-reloaded"
 
 
-@pytest.mark.parametrize("host", ["console.nace.ai.", "CONSOLE.NACE.AI", "drex.stage.nace.ai:443"])
+@pytest.mark.parametrize("host", ["console.nace.ai.", "CONSOLE.NACE.AI", "drex.nace.ai:443"])
 def test_trusted_host_variants_keep_ambient_key(monkeypatch, drex, host):
     monkeypatch.setenv("NACE_API_KEY", "nace_sk_FAKE_FOR_TEST")
     classifier = NaceClassifier(

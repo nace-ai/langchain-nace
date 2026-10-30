@@ -143,8 +143,7 @@ Asking uses a LangGraph `interrupt`. Resume it with `{"type": "approve"}`, `{"ty
 Every request sends `User-Agent` and `X-Nace-Client: langchain-nace/<version>`. On OpenRouter it also sends `HTTP-Referer` and `X-OpenRouter-Title`.
 
 `NACE_API_KEY` is used automatically only over HTTPS on port 443 at
-`console.nace.ai`, `console.test.nace.ai`, `console.stage.nace.ai` and their
-legacy `drex` equivalents. Other destinations, including localhost, require
+`console.nace.ai` and its legacy production alias `drex.nace.ai`. Other destinations, including localhost, require
 an explicit provider key:
 
 ```python
@@ -163,16 +162,19 @@ OpenRouter, or `NACE_CUSTOM_API_KEY` for other hosts, instead of `NACE_API_KEY`.
 
 Versions 0.1.0–0.1.2 could send `NACE_API_KEY` to a custom `base_url` when no
 explicit key was supplied, and could send a Vercel bypass token even with an
-explicit provider key. Upgrade to 0.1.3 or later. If you used that configuration
+explicit provider key. Upgrade to 0.1.4 or later. If you used that configuration
 with real credentials, replace and revoke those credentials; upgrading does not
 revoke them or remove copies held by another provider.
 
 Custom-provider classifiers serialized by 0.1.0–0.1.2 may still reference
-`NACE_API_KEY`. Recreate those classifiers with 0.1.3 or later using the correct
+`NACE_API_KEY`. Recreate those classifiers with 0.1.4 or later using the correct
 provider key, then serialize them again. Do not reload an old custom-provider
 manifest with your Nace key supplied through `secrets_map` or
 `secrets_from_env=True`. Upgrading the package cannot change secret references
 already stored in older manifests.
+
+Version 0.1.4 restricts automatic credentials to production destinations;
+non-production endpoints require an explicit key, like any custom provider.
 
 ## Errors
 
