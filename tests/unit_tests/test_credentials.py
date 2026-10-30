@@ -129,6 +129,28 @@ def test_custom_host_serializes_provider_secret(drex, url, secret):
     assert dumpd(classifier)["kwargs"]["api_key"]["id"] == [secret]
 
 
+def test_openrouter_format_override_on_custom_host_keeps_custom_secret(monkeypatch, drex):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-REAL_OPENROUTER_FAKE")
+    classifier = NaceClassifier(
+        api_key="sk-gateway-test",
+        base_url="https://gateway.example",
+        openrouter=True,
+        http_client=httpx.Client(transport=drex.transport()),
+    )
+    serialized = dumpd(classifier)
+    assert serialized["kwargs"]["api_key"]["id"] == ["NACE_CUSTOM_API_KEY"]
+    # `load` refuses this namespace, so resolve the secret the way a reload would.
+    secrets = {"NACE_CUSTOM_API_KEY": "sk-gateway-reloaded"}
+    reloaded = NaceClassifier(
+        api_key=secrets[serialized["kwargs"]["api_key"]["id"][0]],
+        base_url=serialized["kwargs"]["base_url"],
+        openrouter=serialized["kwargs"].get("openrouter"),
+        http_client=httpx.Client(transport=drex.transport()),
+    )
+    reloaded.invoke(CALL)
+    assert drex.requests[0].headers["authorization"] == "Bearer sk-gateway-reloaded"
+
+
 @pytest.mark.parametrize("host", ["console.nace.ai.", "CONSOLE.NACE.AI", "drex-stage.example.invalid:443"])
 def test_trusted_host_variants_keep_ambient_key(monkeypatch, drex, host):
     monkeypatch.setenv("NACE_API_KEY", "nace_sk_FAKE_FOR_TEST")

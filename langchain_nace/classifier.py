@@ -269,8 +269,13 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
     def lc_secrets(self) -> dict[str, str]:
         if _is_nace_destination(self.base_url):
             return {"api_key": "NACE_API_KEY"}
-        # Reloading a serialized custom provider must never substitute a Nace key.
-        return {"api_key": "OPENROUTER_API_KEY" if self._openrouter else "NACE_CUSTOM_API_KEY"}
+        # Reloading a serialized custom provider must never substitute a Nace key, and
+        # the secret follows the destination, not the `openrouter` request-format override.
+        return {
+            "api_key": "OPENROUTER_API_KEY"
+            if _is_openrouter(self.base_url)
+            else "NACE_CUSTOM_API_KEY"
+        }
 
     @override
     def invoke(
