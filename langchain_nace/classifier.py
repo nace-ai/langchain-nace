@@ -38,11 +38,7 @@ DEFAULT_BASE_URL = "https://console.nace.ai"
 NACE_HOSTS = frozenset(
     {
         "console.nace.ai",
-        "console.test.nace.ai",
-        "console.stage.nace.ai",
         "drex.nace.ai",
-        "drex.test.nace.ai",
-        "drex.stage.nace.ai",
     }
 )
 

@@ -175,7 +175,8 @@ OpenRouter, or `NACE_API_KEY` for other endpoints; the key itself is not seriali
 Same-origin redirects retain credentials when the supplied HTTP client follows
 redirects. A redirect to a different scheme, host or port strips authentication,
 cookies and internal deployment headers. Internal deployment credentials are also
-excluded from custom endpoints.
+excluded from every endpoint except the production HTTPS hosts
+`console.nace.ai` and its legacy alias `drex.nace.ai` on port 443.
 
 Version 0.1.4 restores environment-based custom endpoint configuration, which
 0.1.3 incorrectly restricted to Nace cloud hosts. It retains the provider-specific

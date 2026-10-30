@@ -231,7 +231,7 @@ def test_openrouter_format_override_on_custom_host_keeps_custom_secret(monkeypat
     assert drex.requests[0].headers["authorization"] == "Bearer sk-gateway-reloaded"
 
 
-@pytest.mark.parametrize("host", ["console.nace.ai.", "CONSOLE.NACE.AI", "drex.stage.nace.ai:443"])
+@pytest.mark.parametrize("host", ["console.nace.ai.", "CONSOLE.NACE.AI", "drex.nace.ai:443"])
 def test_trusted_host_variants_keep_ambient_key(monkeypatch, drex, host):
     monkeypatch.setenv("NACE_API_KEY", "nace_sk_FAKE_FOR_TEST")
     classifier = NaceClassifier(
@@ -263,7 +263,7 @@ def test_bypass_cookie_header_is_removed_on_custom_host(drex):
 
 
 @pytest.mark.parametrize("async_call", [False, True])
-@pytest.mark.parametrize("host", ["external.test", "console.test.nace.ai"])
+@pytest.mark.parametrize("host", ["external.test", "drex.nace.ai"])
 async def test_redirect_to_another_origin_does_not_forward_credentials(
     monkeypatch, drex, async_call, host
 ):
@@ -392,7 +392,7 @@ async def test_bypass_headers_only_go_to_exact_nace_https_origins(
     assert "x-vercel-set-bypass-cookie" not in headers
 
 
-@pytest.mark.parametrize("host", ["console.nace.ai.", "CONSOLE.NACE.AI", "drex.stage.nace.ai:443"])
+@pytest.mark.parametrize("host", ["console.nace.ai.", "CONSOLE.NACE.AI", "drex.nace.ai:443"])
 def test_trusted_host_variants_keep_bypass_header(monkeypatch, drex, host):
     monkeypatch.setenv("NACE_VERCEL_PROTECTION_BYPASS", "FAKE_BYPASS_TOKEN")
     classifier = NaceClassifier(
