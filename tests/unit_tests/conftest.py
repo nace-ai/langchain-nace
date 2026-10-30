@@ -22,6 +22,7 @@ def _no_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "NACE_API_KEY",
         "NACE_BASE_URL",
         "NACE_DEFAULT_DECISION_MODEL",
+        "OPENROUTER_API_KEY",
         "DREX_API_KEY",
         "DREX_BASE_URL",
         "DREX_DEFAULT_MODEL",

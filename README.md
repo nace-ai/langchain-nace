@@ -37,7 +37,7 @@ response.scores["mood"].score  # 1.1: expected level
 
 All questions about one state go in one request. Answers keep their full probabilities, so thresholds stay in your code. `ainvoke`, `batch` and `abatch` work as on any Runnable. `batch` runs at most 8 requests at once unless you set `max_concurrency`.
 
-**Switching from `langchain-typesafe`:** change `langchain_typesafe` to `langchain_nace` in your imports, `TypeSafeClassifier` to `NaceClassifier`, and set `NACE_API_KEY` (used only for the Nace hosts listed under Backends; for any other `base_url`, pass that provider's key as `api_key=`). Everything else keeps its name and arguments:
+**Switching from `langchain-typesafe`:** change `langchain_typesafe` to `langchain_nace` in your imports, `TypeSafeClassifier` to `NaceClassifier`, and set `NACE_API_KEY` and, for your own endpoint, `NACE_BASE_URL` (OpenRouter uses `OPENROUTER_API_KEY`; see Backends). Everything else keeps its name and arguments:
 
 | `langchain-typesafe` | `langchain-nace` |
 |---|---|
@@ -142,10 +142,24 @@ Asking uses a LangGraph `interrupt`. Resume it with `{"type": "approve"}`, `{"ty
 
 Every request sends `User-Agent` and `X-Nace-Client: langchain-nace/<version>`. On OpenRouter it also sends `HTTP-Referer` and `X-OpenRouter-Title`.
 
-`NACE_API_KEY` is used automatically only over HTTPS on port 443 at
-`console.nace.ai`, `console.test.nace.ai`, `console.stage.nace.ai` and their
-legacy `drex` equivalents. Other destinations, including localhost, require
-an explicit provider key:
+`NACE_API_KEY` and `NACE_BASE_URL` configure the endpoint and its key, including
+on-prem deployments and local HTTP servers. No code change or saved profile is required:
+
+```bash
+export NACE_API_KEY=nace_sk_...
+export NACE_BASE_URL=https://nace.customer.example
+```
+
+```python
+classifier = NaceClassifier()
+```
+
+Explicit `api_key` and `base_url` arguments take precedence. Legacy `DREX_API_KEY`
+and `DREX_BASE_URL` work when the corresponding Nace variable is unset or blank.
+The configured endpoint receives the selected key.
+
+For the exact `openrouter.ai` host, the adapter uses `OPENROUTER_API_KEY` instead
+of inheriting `NACE_API_KEY`. You can also pass that provider's key explicitly:
 
 ```python
 classifier = NaceClassifier(
@@ -154,25 +168,23 @@ classifier = NaceClassifier(
 )
 ```
 
-Without an explicit `api_key`, a custom `base_url` or `NACE_BASE_URL` raises `ValueError` when the classifier is created. This includes the default classifier built by `NaceRouter`, `nace_conditional_edge` and the middleware, so pass `classifier=NaceClassifier(base_url=..., api_key=...)` for custom hosts.
+The key follows the endpoint, even when `openrouter=` overrides the request format.
+Serialized classifiers pin the endpoint and refer to `OPENROUTER_API_KEY` for
+OpenRouter, or `NACE_API_KEY` for other endpoints; the key itself is not serialized.
 
-Vercel bypass headers are removed from requests to other destinations, even
-when an older `nace-sdk` adds `NACE_VERCEL_PROTECTION_BYPASS` automatically.
-Serialized custom-provider classifiers refer to `OPENROUTER_API_KEY` for
-OpenRouter, or `NACE_CUSTOM_API_KEY` for other hosts, instead of `NACE_API_KEY`.
+Same-origin redirects retain credentials when the supplied HTTP client follows
+redirects. A redirect to a different scheme, host or port strips authentication,
+cookies and internal deployment headers. Internal deployment credentials are also
+excluded from custom endpoints.
 
-Versions 0.1.0–0.1.2 could send `NACE_API_KEY` to a custom `base_url` when no
-explicit key was supplied, and could send a Vercel bypass token even with an
-explicit provider key. Upgrade to 0.1.3 or later. If you used that configuration
-with real credentials, replace and revoke those credentials; upgrading does not
-revoke them or remove copies held by another provider.
-
-Custom-provider classifiers serialized by 0.1.0–0.1.2 may still reference
-`NACE_API_KEY`. Recreate those classifiers with 0.1.3 or later using the correct
-provider key, then serialize them again. Do not reload an old custom-provider
-manifest with your Nace key supplied through `secrets_map` or
-`secrets_from_env=True`. Upgrading the package cannot change secret references
-already stored in older manifests.
+Version 0.1.4 restores environment-based custom endpoint configuration, which
+0.1.3 incorrectly restricted to Nace cloud hosts. It retains the provider-specific
+OpenRouter credential policy and fixes cross-origin credential forwarding.
+Versions 0.1.0–0.1.2 could inherit a Nace key for OpenRouter and forward internal
+deployment credentials to other endpoints. If real credentials reached an
+unintended destination, replace and revoke those credentials; upgrading cannot
+revoke them or remove copies held elsewhere. Recreate old OpenRouter serialized
+classifiers with the correct provider secret before reloading them.
 
 ## Errors
 
