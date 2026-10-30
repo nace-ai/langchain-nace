@@ -15,6 +15,7 @@ from langchain_core.runnables import RunnableConfig, RunnableSerializable
 from langchain_core.runnables.config import ensure_config
 from langchain_core.utils import from_env, secret_from_env
 from langsmith.run_helpers import get_current_run_tree
+from nace_sdk.constants import API_KEY_ENV, BASE_URL_ENV, read_env
 from pydantic import ConfigDict, Field, PrivateAttr, SecretStr, field_validator
 from typing_extensions import override
 
@@ -72,6 +73,19 @@ def _is_openrouter(base_url: str | None) -> bool:
 
 def _set_user_agent(request: httpx.Request) -> None:
     request.headers["User-Agent"] = CLIENT_NAME
+    origin = (
+        request.url.scheme,
+        request.url.host.removesuffix("."),
+        request.url.port,
+    )
+    # HTTPX carries extensions to redirect requests. Bind credentials to the
+    # first request's origin, including HTTPS upgrades and other Nace hosts.
+    original_origin = request.extensions.setdefault("langchain_nace.original_origin", origin)
+    if origin != original_origin:
+        request.headers.pop("Authorization", None)
+        request.headers.pop("Cookie", None)
+        request.headers.pop("x-vercel-protection-bypass", None)
+        request.headers.pop("x-vercel-set-bypass-cookie", None)
     # Check the final request URL, including redirected requests and custom clients.
     # Older nace-sdk versions add this environment token for every destination.
     if not _is_nace_destination(str(request.url)):
@@ -134,8 +148,8 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         model: Drex model id. Defaults to `NACE_DEFAULT_DECISION_MODEL`, else
             `drex-max` (reads images; up to 16 questions per request). Use
             `drex-v2.0` for text-only batches of up to 512 questions.
-        api_key: Provider key. Defaults to `NACE_API_KEY` only for Nace HTTPS hosts.
-            Other hosts require an explicit key belonging to that provider.
+        api_key: Provider key. Defaults to `NACE_API_KEY` (legacy `DREX_API_KEY`)
+            for the configured endpoint. OpenRouter uses `OPENROUTER_API_KEY`.
         base_url: API root. Defaults to `NACE_BASE_URL`, else `https://console.nace.ai`.
             Also works with OpenRouter (`https://openrouter.ai/api`), the Vercel AI
             Gateway (`.../typesafe`) and other TypeSafe-compatible hosts.
@@ -156,7 +170,7 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         repr=False,
     )
     base_url: str | None = Field(
-        default_factory=from_env("NACE_BASE_URL", default=None), validate_default=True
+        default_factory=lambda: read_env(BASE_URL_ENV), validate_default=True
     )
     timeout: float = Field(default=MIN_TIMEOUT, ge=MIN_TIMEOUT)
     max_retries: int = Field(default=2, ge=0)
@@ -172,12 +186,19 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
 
     _client: nace_sdk.NaceClient = PrivateAttr()
     _aclient: nace_sdk.AsyncNaceClient = PrivateAttr()
+    _effective_base_url: str = PrivateAttr()
 
     @field_validator("base_url")
     @classmethod
     def _blank_base_url_is_default(cls, base_url: str | None) -> str | None:
         # An empty NACE_BASE_URL (common in CI and .env files) means "use the default".
-        return base_url.strip() or None if base_url is not None else None
+        value = base_url.strip() or None if base_url is not None else None
+        if value is not None:
+            parsed = urlsplit(value)
+            if parsed.username is not None or parsed.password is not None:
+                message = "base_url must not contain userinfo; pass credentials using api_key."
+                raise ValueError(message)
+        return value
 
     @field_validator("model")
     @classmethod
@@ -190,15 +211,23 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
 
     @override
     def model_post_init(self, context: Any, /) -> None:
+        self._effective_base_url = (
+            self._blank_base_url_is_default(
+                self.base_url or read_env(BASE_URL_ENV) or DEFAULT_BASE_URL
+            )
+            or DEFAULT_BASE_URL
+        )
         env_key: SecretStr | None = None
-        if _is_nace_destination(self.base_url):
+        if self.api_key is None:
             # Keep the ambient key out of the public `api_key` field: LangChain rebuilds
             # configurable models from the fields, which would make it look explicit.
-            if self.api_key is None:
-                env_key = secret_from_env("NACE_API_KEY", default=None)()
-        elif self.api_key is None or not self.api_key.get_secret_value().strip():
-            message = "A custom base_url requires an explicit api_key for that provider."
-            raise ValueError(message)
+            if _is_openrouter(self._effective_base_url):
+                env_key = secret_from_env("OPENROUTER_API_KEY", default=None)()
+                if env_key is None or not env_key.get_secret_value().strip():
+                    message = "OpenRouter requires api_key or OPENROUTER_API_KEY."
+                    raise ValueError(message)
+            elif value := read_env(API_KEY_ENV):
+                env_key = SecretStr(value)
         headers = dict(self.default_headers or {})
         if self._openrouter:
             headers.setdefault("HTTP-Referer", "https://nace.ai")
@@ -234,7 +263,11 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
 
     @property
     def _openrouter(self) -> bool:
-        return self.openrouter if self.openrouter is not None else _is_openrouter(self.base_url)
+        return (
+            self.openrouter
+            if self.openrouter is not None
+            else _is_openrouter(self._effective_base_url)
+        )
 
     @property
     def _provider(self) -> str:
@@ -242,12 +275,10 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
 
     @property
     def _base_url(self) -> str | None:
-        if self.base_url and self._openrouter:
+        if self._openrouter:
             # OpenRouter documents `.../api/v1`; the SDK appends `/v1/systemone` itself.
-            return self.base_url.rstrip("/").removesuffix("/v1")
-        # Send the destination that was checked, so the SDK cannot resolve another
-        # one from its own environment variables.
-        return self.base_url or DEFAULT_BASE_URL
+            return self._effective_base_url.rstrip("/").removesuffix("/v1")
+        return self._effective_base_url
 
     @classmethod
     @override
@@ -264,19 +295,16 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
     def lc_attributes(self) -> dict[str, Any]:
         # Always record the destination, so a reload cannot pair the saved secret
         # name with a different base_url taken from the reload environment.
-        return {"base_url": self.base_url or DEFAULT_BASE_URL}
+        return {"base_url": self._effective_base_url}
 
     @property
     @override
     def lc_secrets(self) -> dict[str, str]:
-        if _is_nace_destination(self.base_url):
-            return {"api_key": "NACE_API_KEY"}
-        # Reloading a serialized custom provider must never substitute a Nace key, and
-        # the secret follows the destination, not the `openrouter` request-format override.
+        # The provider follows the destination, not the request-format override.
         return {
             "api_key": "OPENROUTER_API_KEY"
-            if _is_openrouter(self.base_url)
-            else "NACE_CUSTOM_API_KEY"
+            if _is_openrouter(self._effective_base_url)
+            else "NACE_API_KEY"
         }
 
     @override
