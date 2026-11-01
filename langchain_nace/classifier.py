@@ -13,7 +13,7 @@ import nace_sdk
 from langchain_core._api import beta
 from langchain_core.runnables import RunnableConfig, RunnableSerializable
 from langchain_core.runnables.config import ensure_config
-from langchain_core.utils import from_env, secret_from_env
+from langchain_core.utils import from_env
 from langsmith.run_helpers import get_current_run_tree
 from nace_sdk.constants import API_KEY_ENV, BASE_URL_ENV, read_env
 from pydantic import ConfigDict, Field, PrivateAttr, SecretStr, field_validator
@@ -68,7 +68,51 @@ def is_text_only(model: str) -> bool:
 def _is_openrouter(base_url: str | None) -> bool:
     if not base_url:
         return False
-    return (urlsplit(base_url).hostname or "").removesuffix(".") == "openrouter.ai"
+    host = (urlsplit(base_url).hostname or "").removesuffix(".")
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+
+
+OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
+OPENROUTER_ATTRIBUTION = {
+    "HTTP-Referer": "https://nace.ai",
+    "X-OpenRouter-Title": "Drex for LangChain",
+}
+# `X-Title` is OpenRouter's legacy name for the title, so it overrides the title too.
+_TITLE_ALIASES = {"x-openrouter-title": ("x-title",)}
+
+
+def _with_attribution(headers: dict[str, str]) -> dict[str, str]:
+    """Add the default OpenRouter app headers unless the caller set them, in any case."""
+    present = {name.lower() for name in headers}
+    merged = dict(headers)
+    for name, value in OPENROUTER_ATTRIBUTION.items():
+        lowered = name.lower()
+        if present.isdisjoint((lowered, *_TITLE_ALIASES.get(lowered, ()))):
+            merged[name] = value
+    return merged
+
+
+def _openrouter_key(explicit: SecretStr | None) -> SecretStr:
+    """The key for an OpenRouter host: explicit, then `OPENROUTER_API_KEY`, then `NACE_API_KEY`.
+
+    A `nace_` key is a Nace credential and never goes to OpenRouter. An `sk-or-` key kept
+    in `NACE_API_KEY`, as earlier docs said, still works.
+    """
+    if explicit is not None:
+        key = explicit
+    else:
+        value = read_env(OPENROUTER_KEY_ENV) or read_env(API_KEY_ENV)
+        if value is None:
+            message = f"OpenRouter requires api_key or {OPENROUTER_KEY_ENV}."
+            raise ValueError(message)
+        key = SecretStr(value)
+    if key.get_secret_value().strip().startswith("nace_"):
+        message = (
+            "A Nace API key (nace_...) is never sent to OpenRouter. "
+            f"Pass an OpenRouter key as api_key or set {OPENROUTER_KEY_ENV}."
+        )
+        raise ValueError(message)
+    return key
 
 
 def _set_user_agent(request: httpx.Request) -> None:
@@ -149,10 +193,14 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
             `drex-max` (reads images; up to 16 questions per request). Use
             `drex-v2.0` for text-only batches of up to 512 questions.
         api_key: Provider key. Defaults to `NACE_API_KEY` (legacy `DREX_API_KEY`)
-            for the configured endpoint. OpenRouter uses `OPENROUTER_API_KEY`.
+            for the configured endpoint. OpenRouter hosts use `OPENROUTER_API_KEY`
+            (else a `NACE_API_KEY` that isn't a `nace_` key); a `nace_` key is
+            refused there.
         base_url: API root. Defaults to `NACE_BASE_URL`, else `https://console.nace.ai`.
             Also works with OpenRouter (`https://openrouter.ai/api`), the Vercel AI
             Gateway (`.../typesafe`) and other TypeSafe-compatible hosts.
+        default_headers: Extra request headers. On OpenRouter, `HTTP-Referer` and
+            `X-OpenRouter-Title` here replace the defaults, matched case-insensitively.
         timeout: Seconds per request; at least 60, because Drex may take 55 s.
         max_retries: Retries for 408, 429, 5xx and 529, honouring `retry-after-ms`.
         openrouter: Send OpenRouter's request format. Inferred from `base_url`.
@@ -218,20 +266,16 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
             or DEFAULT_BASE_URL
         )
         env_key: SecretStr | None = None
-        if self.api_key is None:
+        on_openrouter = _is_openrouter(self._effective_base_url)
+        if on_openrouter:
+            env_key = _openrouter_key(self.api_key)
+        elif self.api_key is None and (value := read_env(API_KEY_ENV)):
             # Keep the ambient key out of the public `api_key` field: LangChain rebuilds
             # configurable models from the fields, which would make it look explicit.
-            if _is_openrouter(self._effective_base_url):
-                env_key = secret_from_env("OPENROUTER_API_KEY", default=None)()
-                if env_key is None or not env_key.get_secret_value().strip():
-                    message = "OpenRouter requires api_key or OPENROUTER_API_KEY."
-                    raise ValueError(message)
-            elif value := read_env(API_KEY_ENV):
-                env_key = SecretStr(value)
+            env_key = SecretStr(value)
         headers = dict(self.default_headers or {})
-        if self._openrouter:
-            headers.setdefault("HTTP-Referer", "https://nace.ai")
-            headers.setdefault("X-OpenRouter-Title", "Drex for LangChain")
+        if on_openrouter:
+            headers = _with_attribution(headers)
         # The SDK's total retry budget defaults to 30 s, which skips the retry after a
         # slow failed attempt (Drex may take 55 s). `timeout` already bounds each
         # attempt and `max_retries` their number, so the budget is disabled, as in
