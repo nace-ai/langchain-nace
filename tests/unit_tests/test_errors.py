@@ -196,7 +196,10 @@ def test_openrouter_errors_name_openrouter_and_read_cleanly(
     make_classifier, drex: FakeDrex
 ) -> None:
     router = make_classifier(
-        model="nace-ai/drex-max", base_url="https://openrouter.ai/api/v1", max_retries=0
+        model="nace-ai/drex-max",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-or-test",
+        max_retries=0,
     )
     drex.replies.append(
         (
@@ -223,7 +226,10 @@ def test_openrouter_schema_issue_list_becomes_path_message(make_classifier, drex
     from langchain_nace.errors import NaceBadRequestError
 
     router = make_classifier(
-        model="nace-ai/drex-v2.0", base_url="https://openrouter.ai/api/v1", max_retries=0
+        model="nace-ai/drex-v2.0",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="sk-or-test",
+        max_retries=0,
     )
     zod = '[{"code":"invalid_union","path":["questions","q","type"],"message":"Invalid input"}]'
     drex.replies.append((400, {}, {"error": {"code": 400, "message": zod}}))

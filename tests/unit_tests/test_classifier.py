@@ -252,9 +252,9 @@ def test_openrouter_format(make_classifier, drex: FakeDrex) -> None:
 
 def test_openrouter_text_only_model_id_still_refuses_images(make_classifier) -> None:
     with pytest.raises(NaceImageModelError):
-        make_classifier(model="nace-ai/drex-v2.0", base_url="https://openrouter.ai/api").invoke(
-            {"state": "x", "questions": {"q": Noul(instructions="?")}, "images": [RED]}
-        )
+        make_classifier(
+            model="nace-ai/drex-v2.0", base_url="https://openrouter.ai/api", api_key="sk-or-test"
+        ).invoke({"state": "x", "questions": {"q": Noul(instructions="?")}, "images": [RED]})
 
 
 def test_model_kwargs_reach_the_body(make_classifier, drex: FakeDrex) -> None:
@@ -313,7 +313,9 @@ def test_openrouter_refuses_workspace_files(make_classifier) -> None:
     from langchain_nace import NaceImageError
 
     with pytest.raises(NaceImageError, match="inline"):
-        make_classifier(model="nace-ai/drex-max", base_url="https://openrouter.ai/api").invoke(
+        make_classifier(
+            model="nace-ai/drex-max", base_url="https://openrouter.ai/api", api_key="sk-or-test"
+        ).invoke(
             {
                 "state": "x",
                 "questions": {"q": Noul(instructions="?")},

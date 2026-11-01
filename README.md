@@ -151,7 +151,14 @@ Asking uses a LangGraph `interrupt`. Resume it with `{"type": "approve"}`, `{"ty
 | OpenRouter | `https://openrouter.ai/api/v1` | models `nace-ai/drex-v2.0`, `nace-ai/drex-max`; images are sent the way OpenRouter expects |
 | Vercel AI Gateway / TypeSafe-compatible hosts | the host's System One root | same request format as Nace |
 
-Every request sends `User-Agent` and `X-Nace-Client: langchain-nace/<version>`. On OpenRouter it also sends `HTTP-Referer` and `X-OpenRouter-Title`.
+Every request sends `User-Agent` and `X-Nace-Client: langchain-nace/<version>`. On OpenRouter (`openrouter.ai` and its subdomains) it also sends `HTTP-Referer: https://nace.ai` and `X-OpenRouter-Title: Drex for LangChain`, never to other hosts. To show your own app on OpenRouter, set both in `default_headers`; names match in any case and your values replace ours:
+
+```python
+classifier = NaceClassifier(
+    base_url="https://openrouter.ai/api/v1",
+    default_headers={"HTTP-Referer": "https://myapp.example", "X-OpenRouter-Title": "My App"},
+)
+```
 
 `NACE_API_KEY` and `NACE_BASE_URL` configure the endpoint and its key, including
 on-prem deployments and local HTTP servers. No code change or saved profile is required:
@@ -169,8 +176,10 @@ Explicit `api_key` and `base_url` arguments take precedence. Legacy `DREX_API_KE
 and `DREX_BASE_URL` work when the corresponding Nace variable is unset or blank.
 The configured endpoint receives the selected key.
 
-For the exact `openrouter.ai` host, the adapter uses `OPENROUTER_API_KEY` instead
-of inheriting `NACE_API_KEY`. You can also pass that provider's key explicitly:
+For `openrouter.ai` and its subdomains, the adapter uses an explicit `api_key`, else
+`OPENROUTER_API_KEY`, else `NACE_API_KEY` when it isn't a `nace_` key (an `sk-or-` key
+kept there keeps working). A `nace_` key is never sent to OpenRouter: the classifier
+raises an error naming `OPENROUTER_API_KEY`. You can also pass the key explicitly:
 
 ```python
 classifier = NaceClassifier(
