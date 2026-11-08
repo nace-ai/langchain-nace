@@ -48,6 +48,13 @@ response.scores["mood"].score  # 1.1: expected level
 
 All questions about one state go in one request. Answers keep their full probabilities, so thresholds stay in your code. `ainvoke`, `batch` and `abatch` work as on any Runnable. `batch` runs at most 8 requests at once unless you set `max_concurrency`.
 
+Batches stop new SDK dispatch after an unrecovered failure. With
+`return_exceptions=True`, only HTTP 401/402/403 stop the batch; unsent inputs return
+`NaceBatchStoppedError`. Calls already handed to the SDK finish, including their
+SDK retries. Cancelled inputs fail individually. Subclass `invoke`/`ainvoke`
+recovery runs before the stop decision, and callbacks report that final outcome.
+
+
 **Switching from `langchain-typesafe`:** change `langchain_typesafe` to `langchain_nace` in your imports, `TypeSafeClassifier` to `NaceClassifier`, and set `NACE_API_KEY` and, for your own endpoint, `NACE_BASE_URL` (OpenRouter uses `OPENROUTER_API_KEY`; see Backends). Everything else keeps its name and arguments:
 
 | `langchain-typesafe` | `langchain-nace` |
@@ -141,6 +148,91 @@ It answers three questions: a risk score, "destructive?" and "did the user ask f
 
 Asking uses a LangGraph `interrupt`. Resume it with `{"type": "approve"}`, `{"type": "reject", "message": ...}` or `{"type": "edit", "args": {...}}`. If Drex fails, the call is blocked (`on_error="block"`). Questions, thresholds and the policy are all replaceable. Write your own `GatePolicy`, or subclass `GateDecision`.
 
+With a checkpointer, each gated call adds one checkpoint write: a JSON decision
+record from the `NaceGateDecision` task, visible in traces and `updates` streams.
+It contains the call id, a SHA-256 digest of the prepared wire input (including
+screenshots), the validated policy response as JSON text, the decision kind, and
+the gate scope and number of gates seen for that call. Task inputs
+and outputs contain no screenshot bytes or credentials. A normal resume, including
+on another worker, replays this decision and never asks Drex again. It compares
+the current input digest and decision kind before consuming the person's answer;
+if either changed, the call is blocked with a request for a new tool call.
+
+Single-call messages keep the resume formats above. Whenever the latest AIMessage
+has multiple tool calls, every approval answer requires `tool_call_id`, including
+calls dispatched through `Send` or after middleware appends another message. For
+example: `{"type": "approve", "tool_call_id": "call_b"}`. The interrupt sets
+`requires_tool_call_id=True`. Missing or mismatched ids block the call. Interrupts
+also include `nace_gate_id` and `nace_gate_count`; clients may echo the id for
+explicit gate binding. Saved scope/count mismatches require a new tool call.
+
+Each gate decides at most once per tool call id within a task. Repeated invocations
+reuse that decision and the person's first approval/rejection/edit outcome, without
+another Drex request or interrupt. Put the gate **innermost (closest to the tool)**,
+after any middleware that rewrites tool calls, and **before retry middleware**:
+`[argument_transformer, gate, ToolRetryMiddleware(...)]`. At actual tool invocation,
+the name, id, and arguments must still match the approved call, including any edits
+made by the person; a mismatch requires a new tool call. If a retry wraps the gate, it still
+reuses the first decision or raised failure; it cannot obtain a different approval
+for that same call. Separate gates have separate approval scopes, so outer Allow and
+inner AskHuman work together. A final check at ToolNode's actual tool invocation
+requires every saved approval scope to have been reached and its answer consumed.
+Removing a gate therefore cannot reuse an earlier gate's Allow. Opaque custom
+handlers fail closed when another approval scope cannot be verified.
+Changing the middleware stack while approvals are paused is unsupported, including
+adding, removing, or reordering gates or other interrupting middleware. Re-request
+pending approvals after deploying such a change.
+Task records remain checked against the call id;
+a concurrent sibling's record blocks rather than authorizing another call.
+
+The SHA-256 digest compares both the prepared Drex wire input (including screenshots,
+questions and model) and the entire `request.state`, `runtime.context`, and reachable
+runtime `configurable` values. It excludes configurable keys starting with `__`
+and the bookkeeping keys `thread_id`, `checkpoint_id`, `checkpoint_ns`,
+`checkpoint_map`, and `run_id`. These values are compared locally, not sent to Drex
+or included in decision records. JSON encoding uses sorted keys and compact
+separators. Mappings encode sorted key/value pairs with recursively type-tagged
+keys and values, so integer and string keys cannot collide. Sequences preserve
+their type and order; sets and frozensets preserve their type and sort their
+recursively encoded members, making their comparison independent of iteration order. Pydantic objects include every declared field directly,
+regardless of export/exclude settings, plus instance attributes, private attributes,
+computed fields, and extra fields. Dataclasses include every field regardless of `repr`/`compare`
+flags. `SecretStr`/`SecretBytes` use the underlying value
+only in the local hash. Other objects use `repr`; if that representation
+changes across workers, the old approval blocks. Changes through
+`Command(resume=..., update=...)` or a different runtime context also block with
+"request a new tool call".
+
+The `experimental` extra requires **LangGraph >=1.2.16**. Earlier versions treat an
+explicit checkpoint id as replay and can discard saved task results during an
+approval resume, so every approval would be blocked.
+
+Policies receive only the asked, typed answers and declared numeric usage fields;
+raw responses, response extensions and server request ids are omitted. The model
+name and score legends come from the configured request. Probability maps contain
+only offered labels/levels, and future answer types retain only their asked type.
+
+Editing state with `update_state` or forking a checkpoint re-checks as a new call.
+An answer already pending for the previous decision cannot approve or reject the
+new one, even if its new verdict would allow it. Request the call again to obtain
+a new approval. Custom `GateDecision` subclasses need a stable, nonempty `id`
+covering all configuration that changes their behavior to resume after a pause.
+Policies must be deterministic for a given response. Screenshot callbacks run
+again to compare inputs during replay and must not call `task()` or `interrupt()`.
+
+`on_error="block"` saves a failed check as a block and replays it without asking
+Drex or capturing screenshots again. `on_error="raise"` and cancellation escape
+the decision task without saving a result; retrying the failed run checks again.
+Python permits outer middleware to catch task errors, so a caught error alone does
+not necessarily fail the run. Within one task, a repeated invocation re-raises that
+same failure; restarting the failed graph run performs a new check. The gate never
+searches later task positions for a saved decision after a failure.
+
+In 0.1.5, score legends must match the length of the rubric asked, every asked
+question must be answered with its own type, and choices must use offered labels.
+Malformed answers block the gate through `on_error`. **Approvals paused by
+0.1.4 or earlier must be re-requested after upgrading to 0.1.5.**
+
 [`examples/support_agent.py`](https://github.com/nace-ai/langchain-nace/blob/main/examples/support_agent.py) runs four live scenarios: an allowed read, a blocked unrequested delete, a person approving a requested delete, and a screenshot-based block on a computer-use click.
 
 ## Backends
@@ -200,7 +292,9 @@ classifiers with the correct provider secret before reloading them.
 
 ## Errors
 
-Errors also inherit LangChain's `Model*Error` classes, and messages never include your state:
+Errors also inherit LangChain's `Model*Error` classes. Displayed summaries are bounded
+and redact configured API keys and bearer tokens. SDK response validation errors omit
+response-supplied field paths; `.body` still holds the upstream payload for inspection:
 
 | Error | When |
 |---|---|

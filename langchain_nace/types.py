@@ -11,8 +11,10 @@ from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal, NotRequired, TypeAlias
 
 from langchain_core.messages import BaseMessage
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 from typing_extensions import TypedDict
+
+from langchain_nace.errors import NaceAPIResponseValidationError
 
 _QuestionContent: TypeAlias = str | dict[str, JsonValue] | list[JsonValue]
 _StateValue: TypeAlias = (
@@ -112,7 +114,7 @@ class NoulAnswer(BaseModel):
     """Probability that the answer to a `Noul` is yes."""
 
     type: Literal["noul"] = "noul"
-    noul: float
+    noul: float = Field(strict=True)
     """Probability of yes, from 0 to 1."""
 
 
@@ -123,10 +125,10 @@ class ChoiceAnswer(BaseModel):
     choice: str
     """The selected label."""
 
-    probabilities: dict[str, float]
+    probabilities: dict[str, Annotated[float, Field(strict=True)]]
     """Probability of each label."""
 
-    confidence: float
+    confidence: float = Field(strict=True)
     """How sure the model is; not the same number as the top probability."""
 
 
@@ -134,16 +136,16 @@ class ScoreAnswer(BaseModel):
     """Expected score with its rubric and level probabilities."""
 
     type: Literal["score"] = "score"
-    score: float
+    score: float = Field(strict=True)
     """Expected level; may fall between two levels."""
 
     legend: dict[int, JsonValue]
     """The rubric, keyed by level."""
 
-    probabilities: dict[int, float]
+    probabilities: dict[int, Annotated[float, Field(strict=True)]]
     """Probability of each level."""
 
-    confidence: float
+    confidence: float = Field(strict=True)
     """How sure the model is."""
 
 
@@ -208,35 +210,104 @@ class ClassifierResponse(BaseModel):
         """Score answers keyed by question id."""
         return {k: a for k, a in self.answers.items() if isinstance(a, ScoreAnswer)}
 
+    def validate_answers(self, asked: Mapping[str, Question]) -> None:
+        """Require answers of the asked types, labels and rubric lengths.
+
+        Messages contain only question-supplied ids and types, never response text.
+        Unknown question types and extra answer ids remain supported.
+        """
+        for name, question in asked.items():
+            label = json.dumps(name[:64], ensure_ascii=True)
+            answer = self.answers.get(name)
+            if answer is None:
+                message = f"Drex returned no answer for question {label}."
+                raise NaceAPIResponseValidationError(message)
+            wire = to_wire(question)
+            kind = wire.get("type")
+            expected = {"noul": NoulAnswer, "choice": ChoiceAnswer, "score": ScoreAnswer}
+            if kind not in expected:
+                continue
+            if not isinstance(answer, expected[kind]):
+                message = f"Drex's answer to question {label} has the wrong type (expected {kind})."
+                raise NaceAPIResponseValidationError(message)
+            criteria = wire.get("criteria")
+            if (
+                isinstance(answer, ChoiceAnswer)
+                and isinstance(criteria, Mapping)
+                and answer.choice not in criteria
+            ):
+                message = f"Drex answered question {label} with a choice that was not offered."
+                raise NaceAPIResponseValidationError(message)
+            if (
+                isinstance(answer, ScoreAnswer)
+                and isinstance(criteria, list)
+                and len(answer.legend) != len(criteria)
+            ):
+                message = f"Drex answered question {label} with a legend of the wrong length."
+                raise NaceAPIResponseValidationError(message)
+
     @classmethod
-    def from_body(cls, body: Mapping[str, Any], request_id: str | None) -> ClassifierResponse:
-        """Build a response from a Drex response body, keeping unknown answer types."""
-        answers: dict[str, Answer] = {}
-        for name, raw in (body.get("answers") or {}).items():
-            answers[name] = _parse_answer(raw)
-        return cls(
-            model=str(body.get("model", "")),
-            answers=answers,
-            usage=Usage.model_validate(body.get("usage") or {}),
-            request_id=request_id or body.get("request_id"),
-            evaluation_time_ms=body.get("evaluation_time_ms"),
-            raw=dict(body),
-        )
+    def from_body(
+        cls,
+        body: Mapping[str, Any],
+        request_id: str | None,
+        asked: Mapping[str, Question] | None = None,
+    ) -> ClassifierResponse:
+        """Build a response, optionally validating it against the questions sent.
+
+        Invalid responses raise a sanitized error without response-supplied text.
+        """
+        try:
+            answers = {name: _parse_answer(raw) for name, raw in body["answers"].items()}
+            response = cls(
+                model=str(body.get("model", "")),
+                answers=answers,
+                usage=Usage.model_validate(body.get("usage") or {}),
+                request_id=request_id or body.get("request_id"),
+                evaluation_time_ms=body.get("evaluation_time_ms"),
+                raw=dict(body),
+            )
+        except (ValidationError, TypeError, ValueError, KeyError, AttributeError):
+            message = "Drex returned an invalid response."
+            raise NaceAPIResponseValidationError(message) from None
+        if asked is not None:
+            response.validate_answers(asked)
+        return response
 
 
 def _parse_answer(raw: Mapping[str, Any]) -> Answer:
     kind = raw.get("type")
     if kind == "noul":
-        return NoulAnswer.model_validate(raw)
+        answer = NoulAnswer.model_validate(raw)
+        _bounded(answer.noul)
+        return answer
     if kind == "choice":
-        return ChoiceAnswer.model_validate(raw)
+        choice = ChoiceAnswer.model_validate(raw)
+        _bounded(choice.confidence)
+        for probability in choice.probabilities.values():
+            _bounded(probability)
+        return choice
     if kind == "score":
         data = dict(raw)
         legend = data.get("legend")
         if isinstance(legend, list):
             data["legend"] = dict(enumerate(legend))
-        return ScoreAnswer.model_validate(data)
+        score = ScoreAnswer.model_validate(data)
+        if not score.legend or set(score.legend) != set(range(len(score.legend))):
+            message = "Drex returned an invalid score legend."
+            raise NaceAPIResponseValidationError(message)
+        _bounded(score.score, len(score.legend) - 1)
+        _bounded(score.confidence)
+        for probability in score.probabilities.values():
+            _bounded(probability)
+        return score
     return RawAnswer.model_validate(raw)
+
+
+def _bounded(value: float, maximum: float = 1) -> None:
+    if not 0 <= value <= maximum:
+        message = "Drex returned an answer with an out-of-range number."
+        raise NaceAPIResponseValidationError(message)
 
 
 def _text(value: JsonValue) -> JsonValue:
