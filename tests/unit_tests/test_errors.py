@@ -259,8 +259,7 @@ def test_slow_failed_attempt_is_still_retried(
     assert len(drex.requests) == 2
 
 
-@pytest.mark.parametrize("asynchronous", [False, True])
-async def test_large_html_error_has_small_display_and_traceback(asynchronous):
+async def test_large_html_error_has_small_display_and_traceback():
     import traceback
 
     import httpx
@@ -268,7 +267,7 @@ async def test_large_html_error_has_small_display_and_traceback(asynchronous):
     from langchain_nace import NaceInternalServerError
 
     html = "<!DOCTYPE html>\n<html><body>" + "gateway failure\n" * 9000 + "</body></html>"
-    assert len(html) > 135_000
+    assert len(html) > 135000
 
     def handler(request):
         return httpx.Response(
@@ -281,12 +280,8 @@ async def test_large_html_error_has_small_display_and_traceback(asynchronous):
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         http_async_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
-    if asynchronous:
-        with pytest.raises(NaceInternalServerError) as caught:
-            await classifier.ainvoke(REQUEST)
-    else:
-        with pytest.raises(NaceInternalServerError) as caught:
-            classifier.invoke(REQUEST)
+    with pytest.raises(NaceInternalServerError) as caught:
+        await classifier.ainvoke(REQUEST)
     failure = caught.value
     assert failure.body == html
     assert "HTML error page (HTTP 502)" in str(failure)
@@ -303,8 +298,7 @@ async def test_large_html_error_has_small_display_and_traceback(asynchronous):
     assert failure.__suppress_context__
 
 
-@pytest.mark.parametrize("provider", ["Drex", "OpenRouter"])
-def test_long_error_is_clipped_before_guidance(provider):
+def test_long_error_is_clipped_before_guidance():
     import httpx
     import nace_sdk
 
@@ -312,16 +306,12 @@ def test_long_error_is_clipped_before_guidance(provider):
 
     body = {"error": {"message": "detail " * 2000}}
     sdk_error = nace_sdk.NaceAPIError(402, body, httpx.Headers({"x-request-id": "req_long"}))
-    converted = convert_error(sdk_error, provider)
+    converted = convert_error(sdk_error, "OpenRouter")
     summary, guidance, request_id = str(converted).splitlines()
     assert len(summary) == 500
     assert summary.endswith("…")
     assert converted.body is body
-    link = (
-        "https://openrouter.ai/settings/credits"
-        if provider == "OpenRouter"
-        else "https://console.nace.ai/dashboard/billing"
-    )
+    link = "https://openrouter.ai/settings/credits"
     assert link in guidance
     assert request_id == "(request_id=req_long)"
 

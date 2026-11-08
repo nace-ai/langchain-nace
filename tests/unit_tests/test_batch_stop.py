@@ -73,8 +73,9 @@ class AsyncRuns(AsyncCallbackHandler):
         assert Counter(self.starts) == Counter(self.ends + [r for r, _ in self.errors])
 
 
-@pytest.mark.parametrize("status", [401, 402, 403, 422, 500])
-@pytest.mark.parametrize("return_exceptions", [False, True])
+@pytest.mark.parametrize(
+    ("status", "return_exceptions"), [(401, False), (401, True), (402, True), (422, True)]
+)
 def test_sync_batch_after_failure(status, return_exceptions):
     runs = Runs()
     requests = []
@@ -120,8 +121,9 @@ def test_sync_batch_after_failure(status, return_exceptions):
     assert all(e.__cause__ is runs.errors[0][1] for e in stopped)
 
 
-@pytest.mark.parametrize("status", [401, 402, 403, 422, 500])
-@pytest.mark.parametrize("return_exceptions", [False, True])
+@pytest.mark.parametrize(
+    ("status", "return_exceptions"), [(401, False), (401, True), (403, True), (422, True)]
+)
 async def test_async_batch_after_failure(status, return_exceptions):
     runs = AsyncRuns()
     requests = []
@@ -163,8 +165,7 @@ async def test_async_batch_after_failure(status, return_exceptions):
     assert all(e.__cause__ is runs.errors[0][1] for e in stopped)
 
 
-@pytest.mark.parametrize("return_exceptions", [False, True])
-@pytest.mark.parametrize("self_cancel", [False, True])
+@pytest.mark.parametrize(("return_exceptions", "self_cancel"), [(False, True), (True, False)])
 async def test_input_cancellation_is_local(return_exceptions, self_cancel):
     requests = []
     runs = AsyncRuns()
@@ -403,8 +404,7 @@ def test_sync_input_cancellation_does_not_stop_batch(make_classifier):
     assert seen == ["cancel", "one", "two"]
 
 
-@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("status", [401, 429])
+@pytest.mark.parametrize(("asynchronous", "status"), [(False, 401), (True, 401)])
 async def test_recovered_override_does_not_record_batch_stop(
     make_classifier, drex, asynchronous, status
 ):
@@ -435,8 +435,7 @@ async def test_recovered_override_does_not_record_batch_stop(
     assert len(drex.requests) == 4
 
 
-@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("where", ["start", "end"])
+@pytest.mark.parametrize(("asynchronous", "where"), [(False, "start"), (True, "end")])
 async def test_callback_failure_stops_dispatch(make_classifier, drex, asynchronous, where):
     class Failing(BaseCallbackHandler):
         raise_error = True

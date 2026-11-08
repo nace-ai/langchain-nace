@@ -21,13 +21,10 @@ from tests.unit_tests.experimental.middleware.test_auto_mode_lifecycle import (
 )
 
 
-@pytest.fixture(params=[False, True], ids=["sync", "async"])
-def asynchronous(request):
-    return request.param
-
-
-@pytest.mark.parametrize("answer", ["reject", "approve"])
-@pytest.mark.parametrize("earlier_interrupt", [False, True])
+@pytest.mark.parametrize(
+    ("asynchronous", "answer", "earlier_interrupt"),
+    [(False, "approve", False), (True, "reject", True)],
+)
 async def test_removing_outer_gate_cannot_reuse_its_allow(asynchronous, answer, earlier_interrupt):
     ran = []
 

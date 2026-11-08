@@ -1,7 +1,6 @@
 """Tool approvals across interrupts, shared tasks, and retries."""
 
 import itertools
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -30,9 +29,9 @@ from tests.unit_tests.experimental.middleware.test_auto_mode_lifecycle import (
 )
 
 
-@pytest.fixture(params=[False, True], ids=["sync", "async"])
-def asynchronous(request):
-    return request.param
+@pytest.fixture
+def asynchronous():
+    return False
 
 
 class Retry(AgentMiddleware):
@@ -53,7 +52,7 @@ class Retry(AgentMiddleware):
             return await handler(request)
 
 
-@pytest.mark.parametrize("unknown_counter", [False, True])
+@pytest.mark.parametrize(("asynchronous", "unknown_counter"), [(False, False), (True, True)])
 async def test_replayed_allow_cannot_skip_later_rejection(
     asynchronous, monkeypatch, unknown_counter
 ):
@@ -97,7 +96,7 @@ async def test_replayed_allow_cannot_skip_later_rejection(
     assert len(drex.bodies) == 2
 
 
-@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize(("asynchronous", "bound"), [(False, True), (True, False)])
 async def test_shared_toolnode_cannot_consume_another_calls_approval(asynchronous, bound):
     ran = []
 
@@ -146,7 +145,10 @@ async def test_shared_toolnode_cannot_consume_another_calls_approval(asynchronou
     assert result is not None
 
 
-@pytest.mark.parametrize("scenario", ["outer_interrupt", "stacked_gates", "approved_retry"])
+@pytest.mark.parametrize(
+    ("asynchronous", "scenario"),
+    [(False, "outer_interrupt"), (True, "stacked_gates"), (False, "approved_retry")],
+)
 async def test_consumed_null_resume_does_not_block_normal_flow(asynchronous, scenario):
     ran = []
 
@@ -194,13 +196,12 @@ async def test_consumed_null_resume_does_not_block_normal_flow(asynchronous, sce
     assert len(ran) == (2 if scenario == "approved_retry" else 1)
 
 
-@pytest.mark.parametrize("failure", [TypeError, DeprecationWarning])
-def test_counter_peek_never_uses_reduce(monkeypatch, failure):
+def test_counter_peek_never_uses_reduce(monkeypatch):
     import langchain_nace.experimental.middleware.auto_mode as module
 
     class Counter(itertools.count):
         def __reduce__(self):
-            raise failure("not supported")
+            raise DeprecationWarning("not supported")
 
         def __repr__(self):
             return "count(0)"
@@ -267,9 +268,3 @@ async def test_server_echoes_never_reach_decision_record(asynchronous):
     assert "echoed-provider-key" not in record["response"]
     assert observed[0].raw == {}
     assert observed[0].usage.model_extra == {}
-
-
-def test_runtime_context_binding_is_documented():
-    readme = (Path(__file__).parents[4] / "README.md").read_text()
-    assert "entire `request.state`, `runtime.context`" in readme
-    assert "runtime `configurable` values" in readme

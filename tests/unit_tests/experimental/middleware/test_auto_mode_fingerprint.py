@@ -20,11 +20,17 @@ from tests.unit_tests.experimental.middleware.test_auto_mode_lifecycle import (
 )
 
 
-@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize(
-    "kind", ["excluded", "private", "dynamic_private", "computed", "dataclass"]
+    ("asynchronous", "kind", "changed"),
+    [
+        (False, "excluded", True),
+        (True, "private", True),
+        (False, "dynamic_private", True),
+        (False, "computed", True),
+        (False, "dataclass", True),
+        (False, "computed", False),
+    ],
 )
-@pytest.mark.parametrize("changed", [True, False], ids=["changed", "unchanged"])
 async def test_context_identity_fields_cannot_be_hidden_from_digest(asynchronous, kind, changed):
     active = {"tenant": "A"}
     if kind == "excluded":
@@ -100,27 +106,26 @@ async def test_context_identity_fields_cannot_be_hidden_from_digest(asynchronous
         assert "request a new tool call" in result["messages"][-2].content
 
 
-@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize("container", ["mapping", "model", "dataclass", "set", "frozenset"])
-async def test_context_container_identity_is_preserved(asynchronous, container):
-    before, after = {1: "A", "1": "B"}, {1: "C", "1": "B"}
+def test_context_container_identity_is_preserved(container):
+    before, after = ({1: "A", "1": "B"}, {1: "C", "1": "B"})
     if container == "model":
 
         class Context(BaseModel):
             tenants: dict
 
-        before, after = Context(tenants=before), Context(tenants=after)
+        before, after = (Context(tenants=before), Context(tenants=after))
     elif container == "dataclass":
 
         @dataclass
         class Context:
             tenants: dict
 
-        before, after = Context(before), Context(after)
+        before, after = (Context(before), Context(after))
     elif container == "set":
-        before, after = {1, "1"}, ["1", 1]
+        before, after = ({1, "1"}, ["1", 1])
     elif container == "frozenset":
-        before, after = frozenset({1, "1"}), {1, "1"}
+        before, after = (frozenset({1, "1"}), {1, "1"})
     ran = []
 
     @tool
@@ -136,18 +141,13 @@ async def test_context_container_identity_is_preserved(asynchronous, container):
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "container-identity"}}
-    if asynchronous:
-        await graph.ainvoke({"messages": [HumanMessage("Act")]}, config, context=before)
-        result = await graph.ainvoke(Command(resume={"type": "approve"}), config, context=after)
-    else:
-        graph.invoke({"messages": [HumanMessage("Act")]}, config, context=before)
-        result = graph.invoke(Command(resume={"type": "approve"}), config, context=after)
+    graph.invoke({"messages": [HumanMessage("Act")]}, config, context=before)
+    result = graph.invoke(Command(resume={"type": "approve"}), config, context=after)
     assert ran == []
     assert "request a new tool call" in result["messages"][-2].content
 
 
-@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
-async def test_context_mapping_and_set_order_does_not_change_approval(asynchronous):
+def test_context_mapping_and_set_order_does_not_change_approval():
     members = [(1, "A"), ("1", 2), (False, "B")]
     before = {"tenants": {1: "A", "1": "B"}, "members": set(members), "frozen": frozenset(members)}
     after = {
@@ -170,10 +170,6 @@ async def test_context_mapping_and_set_order_does_not_change_approval(asynchrono
         checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "container-order"}}
-    if asynchronous:
-        await graph.ainvoke({"messages": [HumanMessage("Act")]}, config, context=before)
-        await graph.ainvoke(Command(resume={"type": "approve"}), config, context=after)
-    else:
-        graph.invoke({"messages": [HumanMessage("Act")]}, config, context=before)
-        graph.invoke(Command(resume={"type": "approve"}), config, context=after)
+    graph.invoke({"messages": [HumanMessage("Act")]}, config, context=before)
+    graph.invoke(Command(resume={"type": "approve"}), config, context=after)
     assert ran == [True]

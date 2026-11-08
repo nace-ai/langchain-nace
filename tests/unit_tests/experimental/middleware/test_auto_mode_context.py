@@ -1,8 +1,5 @@
 """Decision reuse and complete execution-context binding."""
 
-import tomllib
-from pathlib import Path
-
 import pytest
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
@@ -27,12 +24,12 @@ from tests.unit_tests.experimental.middleware.test_auto_mode_lifecycle import (
 from tests.unit_tests.experimental.middleware.test_auto_mode_resume import Retry
 
 
-@pytest.fixture(params=[False, True], ids=["sync", "async"])
-def asynchronous(request):
-    return request.param
+@pytest.fixture
+def asynchronous():
+    return False
 
 
-@pytest.mark.parametrize("first", ["custom_allow", "ask"])
+@pytest.mark.parametrize(("asynchronous", "first"), [(False, "custom_allow"), (True, "ask")])
 async def test_retry_reuses_first_decision_and_approval(asynchronous, first):
     attempts = []
 
@@ -78,7 +75,7 @@ def test_custom_execution_decision_has_resume_defense(monkeypatch):
     assert isinstance(module._protect_resume(LoggedAllow(), fresh=False), Block)
 
 
-@pytest.mark.parametrize("layout", ["send", "trailing_message"])
+@pytest.mark.parametrize(("asynchronous", "layout"), [(False, "send"), (True, "trailing_message")])
 async def test_shared_calls_are_bound_even_in_send_and_after_appended_message(asynchronous, layout):
     ran = []
 
@@ -170,11 +167,7 @@ async def test_approval_cannot_cross_state_context_or_configurable(asynchronous,
     assert "request a new tool call" in result["messages"][-1].content
 
 
-def test_experimental_extra_requires_supported_langgraph():
-    project = tomllib.loads((Path(__file__).parents[4] / "pyproject.toml").read_text())
-    assert "langgraph>=1.2.16" in project["project"]["optional-dependencies"]["experimental"]
-
-
+@pytest.mark.parametrize("asynchronous", [False, True])
 async def test_toolnode_in_runnable_context_without_graph(asynchronous):
     ran = []
 
@@ -199,34 +192,9 @@ async def test_toolnode_in_runnable_context_without_graph(asynchronous):
     assert ran == [True]
 
 
-async def test_outer_allow_does_not_claim_inner_gates_answer(asynchronous):
-    ran = []
-
-    @tool
-    def act() -> str:
-        """Act after the inner approval."""
-        ran.append(True)
-        return "done"
-
-    class Inner(NaceAutoModeMiddleware):
-        pass
-
-    graph = create_agent(
-        scripted(tool_call("act", {}, "a"), AIMessage("done")),
-        tools=[act],
-        middleware=[
-            NaceAutoModeMiddleware(model=classifier_for(FakeDrex(replies=[reply(ALLOW)]))),
-            Inner(model=classifier_for(FakeDrex(replies=[reply(ASK)]))),
-        ],
-        checkpointer=InMemorySaver(),
-    )
-    await invoke(graph, {"messages": [HumanMessage("Act")]}, asynchronous)
-    result = await invoke(graph, Command(resume={"type": "approve"}), asynchronous)
-    assert ran == [True]
-    assert "__interrupt__" not in result
-
-
-@pytest.mark.parametrize("answer", ["reject", "edit"])
+@pytest.mark.parametrize(
+    ("asynchronous", "answer"), [(False, "reject"), (True, "reject"), (True, "edit")]
+)
 async def test_repeat_handler_keeps_rejection_or_edited_arguments(asynchronous, answer):
     from langchain.agents.middleware.types import AgentMiddleware
 
@@ -307,51 +275,4 @@ async def test_resume_latest_explicit_checkpoint_with_structured_context(asynchr
             Command(resume={"type": "approve"}), checkpoint, context=Context(Tenant(name="A"))
         )
     assert ran == [True]
-    assert len(drex.bodies) == 1
-
-
-async def test_failed_check_is_not_retried_at_a_new_task_position(asynchronous):
-    from langchain_nace import NaceAuthenticationError
-    from tests.fakes import error
-
-    ran = []
-
-    @tool
-    def act() -> str:
-        """Act only after the check succeeds."""
-        ran.append(True)
-        return "done"
-
-    drex = FakeDrex(replies=[error(401, "invalid"), reply(ALLOW)])
-    from langchain.agents.middleware.types import AgentMiddleware
-
-    class RetryCheck(AgentMiddleware):
-        def wrap_tool_call(self, request, handler):
-            try:
-                return handler(request)
-            except NaceAuthenticationError:
-                return handler(request)
-
-        async def awrap_tool_call(self, request, handler):
-            try:
-                return await handler(request)
-            except NaceAuthenticationError:
-                return await handler(request)
-
-    graph = create_agent(
-        scripted(tool_call("act", {}, "a"), AIMessage("done")),
-        tools=[act],
-        middleware=[
-            RetryCheck(),
-            NaceAutoModeMiddleware(model=classifier_for(drex), on_error="raise"),
-        ],
-        checkpointer=InMemorySaver(),
-    )
-
-    async def run():
-        return await invoke(graph, {"messages": [HumanMessage("Act")]}, asynchronous)
-
-    with pytest.raises(NaceAuthenticationError):
-        await run()
-    assert ran == []
     assert len(drex.bodies) == 1

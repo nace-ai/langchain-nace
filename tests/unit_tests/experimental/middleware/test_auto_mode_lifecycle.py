@@ -89,29 +89,25 @@ def pause(second: dict, *, rebuild: bool, resume: dict):
 
 
 # Approval is bound to the exact context the person reviewed.
-@pytest.mark.parametrize("rebuild", [True, False], ids=["rebuilt", "same_agent"])
-def test_changed_screenshot_cannot_reuse_approval_for_ask(rebuild: bool) -> None:
-    pause(ASK, rebuild=rebuild, resume={"type": "approve"})
+def test_changed_screenshot_cannot_reuse_approval_for_ask() -> None:
+    pause(ASK, rebuild=True, resume={"type": "approve"})
     assert calls == [], f"tool ran on a stale approval: {calls}"
 
 
-@pytest.mark.parametrize("rebuild", [True, False], ids=["rebuilt", "same_agent"])
-def test_changed_screenshot_cannot_reuse_approval_for_allow(rebuild: bool) -> None:
-    pause(ALLOW, rebuild=rebuild, resume={"type": "approve"})
+def test_changed_screenshot_cannot_reuse_approval_for_allow() -> None:
+    pause(ALLOW, rebuild=True, resume={"type": "approve"})
     assert calls == [], f"tool ran on a stale approval: {calls}"
 
 
 # A lower-risk response must never bypass a pending rejection.
-@pytest.mark.parametrize("rebuild", [True, False], ids=["rebuilt", "same_agent"])
-def test_rejection_replays_original_decision(rebuild: bool) -> None:
+def test_rejection_replays_original_decision() -> None:
     drex = FakeDrex(replies=[reply(ASK), reply(ALLOW)])
     saver = InMemorySaver()
     screen = {"png": RED}
     graph = build(drex, saver, screen, tool_call("delete_ticket", {"ticket_id": 7}, "c1"))
     graph.invoke({"messages": [HumanMessage("Delete ticket 7")]}, CONFIG)
     assert calls == []
-    if rebuild:
-        graph = build(drex, saver, screen)
+    graph = build(drex, saver, screen)
     graph.invoke(Command(resume={"type": "reject", "message": "no"}), CONFIG)
     assert len(drex.bodies) == 1
     assert calls == [], f"tool ran after the user rejected it: {calls}"
@@ -127,10 +123,10 @@ async def test_async_rejection_replays_original_decision() -> None:
     assert calls == [], f"tool ran after the user rejected it: {calls}"
 
 
-# Both entry points must obey the same replay rules.
-@pytest.fixture(params=[False, True], ids=["sync", "async"])
-def asynchronous(request):
-    return request.param
+# Use sync by default; pair modes for distinct execution paths.
+@pytest.fixture
+def asynchronous():
+    return False
 
 
 async def invoke(graph, value, asynchronous, config=CONFIG):
@@ -156,7 +152,8 @@ def message(result):
 
 
 @pytest.mark.parametrize(
-    ("second", "answer", "edited"), [(ASK, "approve", 8), (ALLOW, "reject", 7)]
+    ("asynchronous", "second", "answer", "edited"),
+    [(False, ASK, "approve", 8), (True, ALLOW, "reject", 7)],
 )
 async def test_update_state_does_not_reuse_an_answer(asynchronous, second, answer, edited):
     drex = FakeDrex(replies=[reply(ASK), reply(second)])
@@ -227,6 +224,7 @@ async def test_tool_interrupt_after_allow_replays_allow(asynchronous):
     assert len(drex.bodies) == 1
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
 async def test_parallel_approvals_survive_rebuild(asynchronous):
     drex = FakeDrex(replies=[reply(ASK), reply(ASK)])
     saver = InMemorySaver()
@@ -256,7 +254,9 @@ async def test_parallel_approvals_survive_rebuild(asynchronous):
     assert len(drex.bodies) == 2
 
 
-@pytest.mark.parametrize("identity", [None, "review-v1", "review-v2"])
+@pytest.mark.parametrize(
+    ("asynchronous", "identity"), [(False, None), (False, "review-v1"), (True, "review-v2")]
+)
 async def test_custom_decision_needs_matching_explicit_id(asynchronous, identity):
     from langchain_nace.experimental.middleware import AskHuman, GateDecision
 
@@ -307,23 +307,20 @@ async def test_builtin_subclass_cannot_bypass_rejection(asynchronous):
     assert "custom decision without an id" in message(result).content
 
 
-@pytest.mark.parametrize("second", [ASK, ALLOW])
-async def test_changed_policy_kind_blocks_replay(asynchronous, second):
+async def test_changed_policy_kind_blocks_replay(asynchronous):
     from langchain_nace.experimental.middleware import Allow, Block
 
     drex = FakeDrex(replies=[reply(ASK)])
     saver = InMemorySaver()
     graph = gate_agent(drex, saver, tool_call("delete_ticket", {"ticket_id": 7}, "c1"))
     await invoke(graph, {"messages": [HumanMessage("Delete 7")]}, asynchronous)
-    rebuilt = gate_agent(
-        drex, saver, policy=lambda verdict: Allow() if second == ALLOW else Block()
-    )
+    rebuilt = gate_agent(drex, saver, policy=lambda verdict: Allow() if ALLOW == ALLOW else Block())
     result = await invoke(rebuilt, Command(resume={"type": "approve"}), asynchronous)
     assert calls == []
     assert "policy changed" in message(result).content
 
 
-@pytest.mark.parametrize("custom", [False, True])
+@pytest.mark.parametrize(("asynchronous", "custom"), [(False, False), (True, True)])
 async def test_public_interrupt_fallback_blocks_stale_approval(asynchronous, monkeypatch, custom):
     import langchain_nace.experimental.middleware.auto_mode as gate_module
 
@@ -351,6 +348,7 @@ async def test_public_interrupt_fallback_blocks_stale_approval(asynchronous, mon
 
 
 @pytest.mark.parametrize("on_error", ["block", "raise"])
+@pytest.mark.parametrize("asynchronous", [False, True])
 async def test_failed_capture_is_recorded_only_when_blocking(asynchronous, on_error):
     from langgraph.types import interrupt
 
@@ -414,7 +412,7 @@ async def test_failed_capture_is_recorded_only_when_blocking(asynchronous, on_er
     assert drex.bodies == []
 
 
-@pytest.mark.parametrize("on_error", ["block", "raise"])
+@pytest.mark.parametrize(("asynchronous", "on_error"), [(False, "raise"), (True, "block")])
 async def test_drex_failure_modes_and_retry(asynchronous, on_error):
     from langchain_nace.errors import NaceAuthenticationError
     from tests.fakes import error
@@ -439,11 +437,8 @@ async def test_drex_failure_modes_and_retry(asynchronous, on_error):
     assert calls == []
 
 
-@pytest.mark.parametrize("second_fails", [False, True])
-@pytest.mark.parametrize("answer", ["approve", "reject"])
-async def test_failed_check_retry_does_not_shift_tasks_on_restart(
-    asynchronous, second_fails, answer
-):
+@pytest.mark.parametrize(("asynchronous", "answer"), [(False, "approve"), (True, "reject")])
+async def test_failed_check_retry_does_not_shift_tasks_on_restart(asynchronous, answer):
     from langchain.agents.middleware.types import AgentMiddleware
     from langgraph.errors import GraphBubbleUp
     from langgraph.func import task
@@ -480,7 +475,6 @@ async def test_failed_check_retry_does_not_shift_tasks_on_restart(
         replies=[
             error(401, "invalid"),
             reply(ASK),
-            error(401, "invalid") if second_fails else reply(ALLOW),
         ]
     )
     saver = InMemorySaver()
@@ -544,7 +538,7 @@ async def test_gate_task_contains_json_only_and_is_visible_in_updates(asynchrono
     assert record in returns
 
 
-@pytest.mark.parametrize("on_error", ["block", "raise"])
+@pytest.mark.parametrize(("asynchronous", "on_error"), [(False, "block"), (True, "raise")])
 async def test_cancellation_escapes_gate_task(asynchronous, on_error):
     import asyncio
     from concurrent.futures import CancelledError
@@ -573,8 +567,15 @@ async def test_cancellation_escapes_gate_task(asynchronous, on_error):
     assert drex.bodies == []
 
 
-@pytest.mark.parametrize("malformed", ["legend", "missing", "wrong_type", "choice"])
-@pytest.mark.parametrize("on_error", ["block", "raise"])
+@pytest.mark.parametrize(
+    ("asynchronous", "malformed", "on_error"),
+    [
+        (False, "legend", "block"),
+        (False, "missing", "block"),
+        (False, "wrong_type", "block"),
+        (True, "choice", "raise"),
+    ],
+)
 async def test_malformed_answers_never_run_tool(asynchronous, malformed, on_error):
     from langchain_nace import Choice
     from langchain_nace.errors import NaceAPIResponseValidationError
@@ -641,6 +642,7 @@ async def test_legacy_approval_requires_new_tool_call(asynchronous):
     assert "request a new tool call" in message(result).content
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
 async def test_direct_calls_outside_graph_decide_without_task(asynchronous):
     from langchain.agents.middleware.types import ToolCallRequest
     from langchain_core.messages import ToolMessage

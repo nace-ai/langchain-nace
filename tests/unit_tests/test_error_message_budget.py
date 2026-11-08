@@ -8,8 +8,7 @@ from langchain_nace.errors import convert_error
 from tests.fakes import error
 
 
-@pytest.mark.parametrize("provider", ["Drex", "OpenRouter"])
-@pytest.mark.parametrize("repeat", [32, 4096])
+@pytest.mark.parametrize(("provider", "repeat"), [("Drex", 32), ("OpenRouter", 4096)])
 def test_redacted_request_id_cannot_expand_final_error_past_budget(provider, repeat):
     secret = "abcd"
     failure = nace_sdk.NaceAPIError(

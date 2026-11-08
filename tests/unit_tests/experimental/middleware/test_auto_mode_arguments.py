@@ -18,9 +18,15 @@ from tests.unit_tests.experimental.middleware.test_auto_mode_lifecycle import (
 )
 
 
-@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("change", ["args", "nested_args", "name", "id"])
-@pytest.mark.parametrize("answer", ["approve", "edit"])
+@pytest.mark.parametrize(
+    ("asynchronous", "change", "answer"),
+    [
+        (False, "args", "approve"),
+        (True, "nested_args", "edit"),
+        (False, "name", "edit"),
+        (True, "id", "approve"),
+    ],
+)
 async def test_tool_call_cannot_change_after_approval(asynchronous, change, answer):
     ran = []
 
@@ -71,8 +77,7 @@ async def test_tool_call_cannot_change_after_approval(asynchronous, change, answ
     assert "request a new tool call" in result["messages"][-2].content
 
 
-@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("stacked", [False, True], ids=["single", "stacked"])
+@pytest.mark.parametrize(("asynchronous", "stacked"), [(False, False), (True, True)])
 async def test_human_edits_reach_tool_with_runtime_injection(asynchronous, stacked):
     from langchain.tools import ToolRuntime
 

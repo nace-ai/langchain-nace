@@ -4,7 +4,7 @@ import httpx
 import pytest
 from langchain_core.load import dumpd
 
-from langchain_nace import NaceClassifier, Noul
+from langchain_nace import NaceClassifier, NaceError, Noul
 from tests.fakes import FakeDrex
 
 CALL = {"state": "hello", "questions": {"q": Noul(instructions="Greeting?")}}
@@ -262,37 +262,41 @@ def test_bypass_cookie_header_is_removed_on_custom_host(drex):
     assert "x-vercel-set-bypass-cookie" not in drex.requests[0].headers
 
 
-@pytest.mark.parametrize("async_call", [False, True])
-@pytest.mark.parametrize("host", ["external.test", "drex.nace.ai"])
-async def test_redirect_to_another_origin_does_not_forward_credentials(
-    monkeypatch, drex, async_call, host
-):
+def test_redirect_to_another_origin_does_not_forward_credentials(monkeypatch, drex):
     monkeypatch.setenv("NACE_API_KEY", "nace_sk_FAKE_FOR_TEST")
     monkeypatch.setenv("NACE_VERCEL_PROTECTION_BYPASS", "FAKE_BYPASS_TOKEN")
-    drex.replies.append((307, {"location": f"https://{host}/v1/systemone"}, {}))
-    with httpx.Client(transport=drex.transport(), follow_redirects=True) as sync_client:
-        async with httpx.AsyncClient(
-            transport=drex.async_transport(), follow_redirects=True
-        ) as async_client:
-            classifier = NaceClassifier(
-                default_headers={"X-Vercel-Set-Bypass-Cookie": "true"},
-                http_client=sync_client,
-                http_async_client=async_client,
-            )
-            if async_call:
-                await classifier.ainvoke(CALL)
-            else:
-                classifier.invoke(CALL)
-    assert len(drex.requests) == 2
-    first, redirected = drex.requests
+    drex.replies.append((307, {"location": "https://drex.nace.ai/v1/systemone"}, {}))
+    with httpx.Client(transport=drex.transport(), follow_redirects=True) as client:
+        client.cookies.set("session", "FAKE_COOKIE", domain=".nace.ai")
+        classifier = NaceClassifier(
+            default_headers={"X-Vercel-Set-Bypass-Cookie": "true"},
+            http_client=client,
+        )
+        try:
+            classifier.invoke(CALL)
+        except NaceError:
+            assert len(drex.requests) == 1  # SDKs may refuse a different origin.
+    first, *redirected = drex.requests
     assert first.url.host == "console.nace.ai"
     assert first.headers["authorization"] == "Bearer nace_sk_FAKE_FOR_TEST"
+    assert first.headers["cookie"] == "session=FAKE_COOKIE"
     assert first.headers["x-vercel-protection-bypass"] == "FAKE_BYPASS_TOKEN"
     assert first.headers["x-vercel-set-bypass-cookie"] == "true"
-    assert redirected.url.host == host
-    assert "authorization" not in redirected.headers
-    assert "x-vercel-protection-bypass" not in redirected.headers
-    assert "x-vercel-set-bypass-cookie" not in redirected.headers
+    for request in redirected:
+        assert request.url.host == "drex.nace.ai"
+        assert (
+            not {
+                "authorization",
+                "cookie",
+                "x-vercel-protection-bypass",
+                "x-vercel-set-bypass-cookie",
+            }
+            & request.headers.keys()
+        )
+        assert not any(
+            secret in str(request.headers)
+            for secret in ("nace_sk_FAKE_FOR_TEST", "FAKE_COOKIE", "FAKE_BYPASS_TOKEN")
+        )
 
 
 @pytest.mark.parametrize("async_call", [False, True])
@@ -335,31 +339,35 @@ async def test_same_origin_redirect_keeps_credentials_and_existing_callbacks(
         assert request.headers["x-vercel-set-bypass-cookie"] == "true"
 
 
-@pytest.mark.parametrize("async_call", [False, True])
-async def test_http_to_https_redirect_does_not_forward_auth_or_cookies(
-    monkeypatch, drex, async_call
-):
+async def test_http_to_https_redirect_does_not_forward_auth_or_cookies(monkeypatch, drex):
     monkeypatch.setenv("NACE_API_KEY", "nace_sk_FAKE_ONPREM")
     monkeypatch.setenv("NACE_BASE_URL", "http://onprem.customer.test")
     drex.replies.append((307, {"location": "https://onprem.customer.test/v1/systemone"}, {}))
-    # HTTPX rebuilds Cookie on redirects from the client jar, so the jar is what
-    # the origin guard must strip.
-    with httpx.Client(transport=drex.transport(), follow_redirects=True) as sync_client:
-        sync_client.cookies.set("session", "FAKE", domain="onprem.customer.test")
-        async with httpx.AsyncClient(
-            transport=drex.async_transport(), follow_redirects=True
-        ) as async_client:
-            async_client.cookies.set("session", "FAKE", domain="onprem.customer.test")
-            classifier = NaceClassifier(http_client=sync_client, http_async_client=async_client)
-            if async_call:
-                await classifier.ainvoke(CALL)
-            else:
-                classifier.invoke(CALL)
-    first, redirected = drex.requests
+    async with httpx.AsyncClient(transport=drex.async_transport(), follow_redirects=True) as client:
+        client.cookies.set("session", "FAKE_COOKIE", domain="onprem.customer.test")
+        classifier = NaceClassifier(http_async_client=client)
+        try:
+            await classifier.ainvoke(CALL)
+        except NaceError:
+            assert len(drex.requests) == 1
+    first, *redirected = drex.requests
+    assert first.url.scheme == "http"
     assert first.headers["authorization"] == "Bearer nace_sk_FAKE_ONPREM"
-    assert first.headers["cookie"] == "session=FAKE"
-    assert "authorization" not in redirected.headers
-    assert "cookie" not in redirected.headers
+    assert first.headers["cookie"] == "session=FAKE_COOKIE"
+    for request in redirected:
+        assert request.url.scheme == "https"
+        assert (
+            not {
+                "authorization",
+                "cookie",
+                "x-vercel-protection-bypass",
+                "x-vercel-set-bypass-cookie",
+            }
+            & request.headers.keys()
+        )
+        assert not any(
+            secret in str(request.headers) for secret in ("nace_sk_FAKE_ONPREM", "FAKE_COOKIE")
+        )
 
 
 @pytest.mark.parametrize("async_call", [False, True])

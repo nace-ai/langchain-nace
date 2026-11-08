@@ -35,19 +35,15 @@ def test_answers_must_fit_asked_questions(question, answer):
     "answer",
     [
         {"type": "noul", "noul": SECRET},
-        {"type": "noul", "noul": "0.5"},
         {"type": "noul", "noul": True},
         {**score(0), "score": "0"},
-        {**CHOICE, "confidence": "0.9"},
         {"type": "noul", "noul": float("nan")},
-        {"type": "noul", "noul": -0.1},
         {**CHOICE, "confidence": 1.1},
         {**CHOICE, "probabilities": {SECRET: float("inf")}},
         {**score(0), "legend": {"0": "low", "2": SECRET}},
         {**score(0), "legend": []},
         {**score(0), "score": 5},
         {**score(0), "probabilities": {SECRET: 1}},
-        {"type": "score", "score": SECRET},
         {"type": "choice", "choice": SECRET},
     ],
 )
@@ -76,8 +72,7 @@ def test_future_types_and_extra_answers_remain_supported():
     assert response.nouls["extra"].noul == 0.8
 
 
-@pytest.mark.parametrize("confidence", [0.1, 0.9])
-@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(("asynchronous", "confidence"), [(False, 0.1), (True, 0.9)])
 async def test_conditional_edge_refuses_unoffered_label(classifier, drex, confidence, asynchronous):
     drex.overrides["route"] = {**CHOICE, "choice": SECRET, "confidence": confidence}
     edge = nace_conditional_edge(

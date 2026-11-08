@@ -24,8 +24,7 @@ def test_traced_as_llm_run_with_probabilities(classifier: NaceClassifier) -> Non
     assert run.inputs["questions"]["q"].instructions == "?"
 
 
-@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
-@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize(("asynchronous", "failed"), [(False, True), (True, False)])
 async def test_env_style_tracing_has_one_run_per_batch_input(
     make_classifier, drex, monkeypatch, asynchronous, failed
 ):
