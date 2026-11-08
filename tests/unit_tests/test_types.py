@@ -49,7 +49,7 @@ def test_response_keeps_unknown_answer_types_and_converts_legend() -> None:
         "answers": {
             "s": {
                 "type": "score",
-                "score": 1.4,
+                "score": 0.7,
                 "legend": ["calm", "angry"],
                 "probabilities": {"0": 0.3, "1": 0.7},
                 "confidence": 0.6,

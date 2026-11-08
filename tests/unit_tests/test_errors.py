@@ -257,3 +257,84 @@ def test_slow_failed_attempt_is_still_retried(
     response = classifier.invoke(REQUEST)
     assert response.nouls["q"].noul == 0.9
     assert len(drex.requests) == 2
+
+
+async def test_large_html_error_has_small_display_and_traceback():
+    import traceback
+
+    import httpx
+
+    from langchain_nace import NaceInternalServerError
+
+    html = "<!DOCTYPE html>\n<html><body>" + "gateway failure\n" * 9000 + "</body></html>"
+    assert len(html) > 135000
+
+    def handler(request):
+        return httpx.Response(
+            502, text=html, headers={"content-type": "text/html", "x-request-id": "req_html"}
+        )
+
+    classifier = NaceClassifier(
+        api_key="nace_sk_test",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        http_async_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(NaceInternalServerError) as caught:
+        await classifier.ainvoke(REQUEST)
+    failure = caught.value
+    assert failure.body == html
+    assert "HTML error page (HTTP 502)" in str(failure)
+    assert str(failure).splitlines() == [
+        "Drex returned an HTML error page (HTTP 502)",
+        "(request_id=req_html)",
+    ]
+    assert len(str(failure)) < 200
+    assert len(repr(failure)) < 250
+    trace = "".join(traceback.format_exception(failure))
+    assert len(trace) < 8000
+    assert "gateway failure" not in trace
+    assert failure.__cause__ is None
+    assert failure.__suppress_context__
+
+
+def test_long_error_is_clipped_before_guidance():
+    import httpx
+    import nace_sdk
+
+    from langchain_nace.errors import convert_error
+
+    body = {"error": {"message": "detail " * 2000}}
+    sdk_error = nace_sdk.NaceAPIError(402, body, httpx.Headers({"x-request-id": "req_long"}))
+    converted = convert_error(sdk_error, "OpenRouter")
+    summary, guidance, request_id = str(converted).splitlines()
+    assert len(summary) == 500
+    assert summary.endswith("…")
+    assert converted.body is body
+    link = "https://openrouter.ai/settings/credits"
+    assert link in guidance
+    assert request_id == "(request_id=req_long)"
+
+
+def test_openrouter_402_links_to_provider_credits(make_classifier, drex):
+    router = make_classifier(base_url="https://openrouter.ai/api/v1", max_retries=0)
+    drex.replies.append(error(402, "not enough credits"))
+    with pytest.raises(NaceInsufficientCreditError) as caught:
+        router.invoke(REQUEST)
+    assert "https://openrouter.ai/settings/credits" in str(caught.value)
+    assert "console.nace.ai" not in str(caught.value)
+
+
+def test_long_issues_are_clipped_but_preserved():
+    import httpx
+    import nace_sdk
+
+    from langchain_nace.errors import convert_error
+
+    issues = [{"path": "state", "message": "invalid " * 2000}]
+    original = nace_sdk.NaceAPIError(
+        422, {"error": {"message": "bad", "issues": issues}}, httpx.Headers()
+    )
+    converted = convert_error(original)
+    assert len(str(converted)) == 500
+    assert converted.issues == issues

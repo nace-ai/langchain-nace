@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 from collections.abc import Sequence
-from typing import Any
+from concurrent.futures import CancelledError
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from threading import Lock
+from typing import Any, NoReturn, cast
 from urllib.parse import urlsplit
 
 import httpx
 import nace_sdk
 from langchain_core._api import beta
+from langchain_core.callbacks import AsyncCallbackManagerForChainRun, CallbackManagerForChainRun
 from langchain_core.runnables import RunnableConfig, RunnableSerializable
-from langchain_core.runnables.config import ensure_config
+from langchain_core.runnables.config import (
+    ensure_config,
+    get_config_list,
+    get_executor_for_config,
+)
 from langchain_core.utils import from_env, secret_from_env
 from langsmith.run_helpers import get_current_run_tree
 from nace_sdk.constants import API_KEY_ENV, BASE_URL_ENV, read_env
@@ -22,10 +33,20 @@ from typing_extensions import override
 from langchain_nace._images import as_data_url, to_drex_image
 from langchain_nace._state import encode_state
 from langchain_nace._version import __version__
-from langchain_nace.errors import NaceError, NaceImageError, NaceImageModelError, convert_error
+from langchain_nace.errors import (
+    NaceAPIError,
+    NaceBatchStoppedError,
+    NaceError,
+    NaceImageError,
+    NaceImageModelError,
+    convert_error,
+)
 from langchain_nace.types import ClassifierRequest, ClassifierResponse, to_wire
 
 logger = logging.getLogger(__name__)
+_request_error_headers: ContextVar[list[str] | None] = ContextVar(
+    "nace_request_error_headers", default=None
+)
 
 # The default model is Drex Max, moved to the newest flagship with each Drex release.
 # Users pin a model with `model=` or NACE_DEFAULT_DECISION_MODEL; nothing else in the
@@ -91,6 +112,20 @@ def _set_user_agent(request: httpx.Request) -> None:
     if not _is_nace_destination(str(request.url)):
         request.headers.pop("x-vercel-protection-bypass", None)
         request.headers.pop("x-vercel-set-bypass-cookie", None)
+    captured = _request_error_headers.get()
+    if captured is not None:
+        # Capture what was sent, including auth hooks and credentials rotated
+        # while a request was in flight. Generated routing/length values are not keys.
+        captured.extend(
+            value
+            for name, value in request.headers.items()
+            if name.lower() not in {"host", "content-length"}
+        )
+    # The SDK has handed this registered input to HTTPX. Release the stop lock
+    # before I/O, while the call and its SDK retries remain in flight.
+    dispatch = _dispatch_context.get()
+    if dispatch is not None:
+        dispatch.release()
 
 
 async def _aset_user_agent(request: httpx.Request) -> None:
@@ -110,6 +145,51 @@ def _with_max_concurrency(
         c if c.get("max_concurrency") else {**c, "max_concurrency": DEFAULT_MAX_CONCURRENCY}
         for c in config
     ]
+
+
+@dataclass
+class _BatchState:
+    owner: NaceClassifier
+    return_exceptions: bool
+    failure: Exception | None = None
+    lock: Lock = field(default_factory=Lock)
+
+    def record(self, error: Exception) -> None:
+        if not self.return_exceptions or (
+            isinstance(error, NaceAPIError) and error.status in (401, 402, 403)
+        ):
+            with self.lock:
+                if self.failure is None:
+                    self.failure = error
+
+    def check(self) -> None:
+        if self.failure is not None:
+            self.reject()
+
+    def reject(self, _: ClassifierRequest | None = None) -> NoReturn:
+        raise NaceBatchStoppedError(
+            "Not sent: an earlier request in this batch failed."
+        ) from self.failure
+
+
+_batch_context: ContextVar[_BatchState | None] = ContextVar("nace_batch", default=None)
+_batch_invocation: ContextVar[_BatchState | None] = ContextVar(
+    "nace_batch_invocation", default=None
+)
+
+
+@dataclass
+class _Dispatch:
+    batch: _BatchState
+    locked: bool = True
+
+    def release(self) -> None:
+        if self.locked:
+            self.locked = False
+            self.batch.lock.release()
+
+
+_dispatch_context: ContextVar[_Dispatch | None] = ContextVar("nace_dispatch", default=None)
 
 
 @beta()
@@ -187,6 +267,7 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
     _client: nace_sdk.NaceClient = PrivateAttr()
     _aclient: nace_sdk.AsyncNaceClient = PrivateAttr()
     _effective_base_url: str = PrivateAttr()
+    _redaction_secrets: tuple[str, ...] = PrivateAttr(default=())
 
     @field_validator("base_url")
     @classmethod
@@ -241,6 +322,21 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         # it rejects) rather than become None and fall back to the SDK's own env lookup.
         secret = self.api_key if self.api_key is not None else env_key
         key = secret.get_secret_value() if secret is not None else None
+        self._redaction_secrets = tuple(
+            value
+            for value in (
+                key,
+                read_env(API_KEY_ENV),
+                os.environ.get("OPENROUTER_API_KEY"),
+                *headers.values(),
+                *(
+                    value.split(" ", 1)[-1]
+                    for name, value in headers.items()
+                    if name.lower() in {"authorization", "proxy-authorization"}
+                ),
+            )
+            if value
+        )
         sync_http = self.http_client or httpx.Client(timeout=self.timeout)
         if _set_user_agent not in sync_http.event_hooks["request"]:
             sync_http.event_hooks["request"].append(_set_user_agent)
@@ -322,6 +418,9 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
             NaceAPIConnectionError: Drex could not be reached.
 
         """
+        invocation = _batch_invocation.get()
+        if invocation is not None and invocation.owner is self:
+            return self._classify(input)
         return self._call_with_config(self._classify, input, self._traced(config), run_type="llm")
 
     @override
@@ -332,6 +431,9 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         **kwargs: Any,
     ) -> ClassifierResponse:
         """Answer one request asynchronously."""
+        invocation = _batch_invocation.get()
+        if invocation is not None and invocation.owner is self:
+            return await self._aclassify(input)
         return await self._acall_with_config(
             self._aclassify, input, self._traced(config), run_type="llm"
         )
@@ -345,13 +447,77 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         return_exceptions: bool = False,
         **kwargs: Any,
     ) -> list[ClassifierResponse]:
-        """Answer many requests; at most 8 at a time unless `max_concurrency` is set."""
-        return super().batch(
-            inputs,
-            _with_max_concurrency(config),
-            return_exceptions=return_exceptions,
-            **kwargs,
-        )
+        """Answer requests with bounded concurrency, stopping dispatch after a failure.
+
+        With `return_exceptions=True`, only HTTP 401/402/403 stop dispatch.
+        Unsent inputs fail in their own callback run with `NaceBatchStoppedError`.
+        Requests already sent finish, including SDK retries. A cancelled input
+        fails alone; other inputs continue.
+        """
+        if not inputs:
+            return []
+        configs = get_config_list(_with_max_concurrency(config), len(inputs))
+        max_concurrency = configs[0].get("max_concurrency") or DEFAULT_MAX_CONCURRENCY
+        if max_concurrency < 1:
+            message = "max_concurrency must be positive."
+            raise ValueError(message)
+        state = _BatchState(self, return_exceptions)
+        results: list[Any] = [None] * len(inputs)
+        next_index = 0
+
+        def worker() -> None:
+            nonlocal next_index
+            token = _batch_context.set(state)
+            try:
+                while True:
+                    with state.lock:
+                        if next_index == len(inputs):
+                            return
+                        index = next_index
+                        next_index += 1
+
+                    def outcome(
+                        request: ClassifierRequest,
+                        run_manager: CallbackManagerForChainRun,
+                        config: RunnableConfig,
+                    ) -> ClassifierResponse:
+                        try:
+                            state.check()
+                            # Trace the complete override outcome once, so an
+                            # internally recovered error cannot stop the batch.
+                            invocation_token = _batch_invocation.set(state)
+                            try:
+                                return self.invoke(request, config, **kwargs)
+                            finally:
+                                _batch_invocation.reset(invocation_token)
+                        except CancelledError:
+                            raise
+                        except Exception as error:
+                            state.record(error)
+                            raise
+
+                    try:
+                        results[index] = self._call_with_config(
+                            outcome, inputs[index], self._traced(configs[index]), run_type="llm"
+                        )
+                    except Exception as error:
+                        if not isinstance(error, CancelledError):
+                            state.record(error)
+                        results[index] = error
+            finally:
+                _batch_context.reset(token)
+
+        with get_executor_for_config(configs[0]) as executor:
+            workers = [executor.submit(worker) for _ in range(min(max_concurrency, len(inputs)))]
+            for future in workers:
+                future.result()
+        if not return_exceptions:
+            if state.failure is not None:
+                raise state.failure
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+        return cast("list[ClassifierResponse]", results)
 
     @override
     async def abatch(
@@ -362,13 +528,74 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         return_exceptions: bool = False,
         **kwargs: Any,
     ) -> list[ClassifierResponse]:
-        """Answer many requests asynchronously; at most 8 at a time by default."""
-        return await super().abatch(
-            inputs,
-            _with_max_concurrency(config),
-            return_exceptions=return_exceptions,
-            **kwargs,
-        )
+        """Answer asynchronously with the same stop policy as `batch`.
+
+        Every dispatched input goes through `ainvoke`, including subclass overrides.
+        Only its final, unrecovered outcome stops dispatch, before error callbacks.
+        """
+        if not inputs:
+            return []
+        configs = get_config_list(_with_max_concurrency(config), len(inputs))
+        max_concurrency = configs[0].get("max_concurrency") or DEFAULT_MAX_CONCURRENCY
+        if max_concurrency < 1:
+            message = "max_concurrency must be positive."
+            raise ValueError(message)
+        state = _BatchState(self, return_exceptions)
+        results: list[Any] = [None] * len(inputs)
+        next_index = 0
+
+        async def worker() -> None:
+            nonlocal next_index
+            token = _batch_context.set(state)
+            try:
+                while next_index < len(inputs):
+                    index = next_index
+                    next_index += 1
+
+                    async def outcome(
+                        request: ClassifierRequest,
+                        run_manager: AsyncCallbackManagerForChainRun,
+                        config: RunnableConfig,
+                    ) -> ClassifierResponse:
+                        try:
+                            state.check()
+                            invocation_token = _batch_invocation.set(state)
+                            try:
+                                return await self.ainvoke(request, config, **kwargs)
+                            finally:
+                                _batch_invocation.reset(invocation_token)
+                        except CancelledError:
+                            raise
+                        except Exception as error:
+                            state.record(error)
+                            raise
+
+                    try:
+                        results[index] = await asyncio.create_task(
+                            self._acall_with_config(
+                                outcome, inputs[index], self._traced(configs[index]), run_type="llm"
+                            )
+                        )
+                    except asyncio.CancelledError as error:
+                        task = asyncio.current_task()
+                        if task is not None and task.cancelling():
+                            raise
+                        results[index] = error
+                    except Exception as error:
+                        if not isinstance(error, CancelledError):
+                            state.record(error)
+                        results[index] = error
+            finally:
+                _batch_context.reset(token)
+
+        await asyncio.gather(*(worker() for _ in range(min(max_concurrency, len(inputs)))))
+        if not return_exceptions:
+            if state.failure is not None:
+                raise state.failure
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+        return cast("list[ClassifierResponse]", results)
 
     def _prepare(self, request: ClassifierRequest) -> dict[str, Any]:
         model = self.model
@@ -400,21 +627,57 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
             "extra_body": self.model_kwargs or None,
         }
 
+    def _error_secrets(self) -> tuple[str, ...]:
+        values = [
+            *self._redaction_secrets,
+            *(self.default_headers or {}).values(),
+            *(_request_error_headers.get() or []),
+        ]
+        for client in (self.http_client, self.http_async_client):
+            if client is not None:
+                values.extend(client.headers.values())
+        return tuple(values + [value.split(" ", 1)[-1] for value in values if " " in value])
+
     def _classify(self, request: ClassifierRequest) -> ClassifierResponse:
+        batch = _batch_context.get()
+        current = batch if batch is not None and batch.owner is self else None
+        if current is not None:
+            current.check()
         call = self._prepare(request)
+        dispatch = _Dispatch(current) if current is not None else None
+        if dispatch is not None:
+            dispatch.batch.lock.acquire()
+        token = _dispatch_context.set(dispatch)
+        header_token = _request_error_headers.set([])
         try:
+            if current is not None:
+                current.check()
             result = self._client.system_one(**call)
         except nace_sdk.NaceError as error:
-            raise convert_error(error, self._provider) from error
-        return self._record(_response(result))
+            raise convert_error(error, self._provider, secrets=self._error_secrets()) from None
+        finally:
+            if dispatch is not None:
+                dispatch.release()
+            _dispatch_context.reset(token)
+            _request_error_headers.reset(header_token)
+        return self._record(_response(result, call["questions"]))
 
     async def _aclassify(self, request: ClassifierRequest) -> ClassifierResponse:
+        batch = _batch_context.get()
+        current = batch if batch is not None and batch.owner is self else None
+        if current is not None:
+            current.check()
         call = self._prepare(request)
+        if current is not None:
+            current.check()
+        header_token = _request_error_headers.set([])
         try:
             result = await self._aclient.system_one(**call)
         except nace_sdk.NaceError as error:
-            raise convert_error(error, self._provider) from error
-        return self._record(_response(result))
+            raise convert_error(error, self._provider, secrets=self._error_secrets()) from None
+        finally:
+            _request_error_headers.reset(header_token)
+        return self._record(_response(result, call["questions"]))
 
     def _traced(self, config: RunnableConfig | None) -> RunnableConfig:
         config = ensure_config(config)
@@ -445,14 +708,14 @@ class NaceClassifier(RunnableSerializable[ClassifierRequest, ClassifierResponse]
         return response
 
 
-def _response(result: nace_sdk.SystemOneResponse) -> ClassifierResponse:
+def _response(result: nace_sdk.SystemOneResponse, asked: dict[str, Any]) -> ClassifierResponse:
     raw = result.raw_http_response
     try:
         body = raw.json()
     except ValueError as error:
         message = "Drex returned a body that isn't JSON."
         raise NaceError(message) from error
-    return ClassifierResponse.from_body(body, raw.headers.get("x-request-id"))
+    return ClassifierResponse.from_body(body, raw.headers.get("x-request-id"), asked)
 
 
 def _openrouter_state(state: Any, images: list[str | dict[str, Any]]) -> list[dict[str, Any]]:

@@ -31,7 +31,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-experimental = ["langchain>=1.4.0,<2.0.0"]
+experimental = ["langchain>=1.4.0,<2.0.0", "langgraph>=1.2.16"]
 
 [project.urls]
 Homepage = "https://console.nace.ai/docs"
@@ -57,8 +57,11 @@ path = "langchain_nace/_version.py"
 [tool.hatch.build.targets.wheel]
 packages = ["langchain_nace"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"THIRD_PARTY_NOTICES.md" = "langchain_nace/THIRD_PARTY_NOTICES.md"
+
 [tool.hatch.build.targets.sdist]
-include = ["langchain_nace", "README.md", "LICENSE"]
+include = ["langchain_nace", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

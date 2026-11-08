@@ -8,6 +8,7 @@ from typing import Any
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 
 from langchain_nace.classifier import NaceClassifier
+from langchain_nace.errors import NaceAPIResponseValidationError
 from langchain_nace.types import Choice, ChoiceAnswer, ClassifierRequest, State
 
 _QUESTION_ID = "route"
@@ -45,6 +46,9 @@ def nace_conditional_edge(
         return {"state": state(graph_state), "questions": {_QUESTION_ID: question}}
 
     def pick(answer: ChoiceAnswer) -> str:
+        if answer.choice not in question.criteria:
+            message = "Drex returned a conditional-edge choice that was not offered."
+            raise NaceAPIResponseValidationError(message)
         return answer.choice if answer.confidence >= min_confidence else low_confidence
 
     def config_for(config: RunnableConfig) -> RunnableConfig:

@@ -2,6 +2,7 @@ import pytest
 from langchain_core.runnables import RunnableLambda
 
 from langchain_nace import Choice, NaceClassifier, NaceLowConfidenceError, NaceRouter
+from langchain_nace.errors import NaceAPIResponseValidationError
 from tests.fakes import FakeDrex
 
 QUESTION = Choice(instructions="Which team?", criteria={"billing": "Payments", "technical": "Bugs"})
@@ -53,7 +54,23 @@ def test_branch_runs_the_selected_runnable(classifier: NaceClassifier) -> None:
     assert chain.invoke("charged twice") == "billing:charged twice"
 
 
-async def test_branch_async_and_unknown_label_runs_default(
+async def test_branch_async_and_unbranched_label_runs_default(
+    classifier: NaceClassifier, drex: FakeDrex
+) -> None:
+    drex.overrides["route"] = {
+        "type": "choice",
+        "choice": "technical",
+        "confidence": 0.9,
+        "probabilities": {"technical": 0.9},
+    }
+    chain = NaceRouter(classifier=classifier, question=QUESTION).branch(
+        {"billing": RunnableLambda(lambda x: "billing")},
+        default=RunnableLambda(lambda x: "default"),
+    )
+    assert await chain.ainvoke("x") == "default"
+
+
+async def test_branch_refuses_a_label_that_was_not_offered(
     classifier: NaceClassifier, drex: FakeDrex
 ) -> None:
     drex.overrides["route"] = {
@@ -66,7 +83,8 @@ async def test_branch_async_and_unknown_label_runs_default(
         {"billing": RunnableLambda(lambda x: "billing")},
         default=RunnableLambda(lambda x: "default"),
     )
-    assert await chain.ainvoke("x") == "default"
+    with pytest.raises(NaceAPIResponseValidationError, match="not offered"):
+        await chain.ainvoke("x")
 
 
 def test_router_trace_metadata(classifier: NaceClassifier) -> None:
