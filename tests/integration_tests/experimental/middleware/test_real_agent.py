@@ -16,11 +16,11 @@ from langgraph.types import Command
 
 from langchain_nace.experimental.middleware import NaceAutoModeMiddleware
 
-pytest.importorskip("langchain_anthropic")
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("ANTHROPIC_API_KEY"), reason="set ANTHROPIC_API_KEY"
-)
 MODEL = os.environ.get("REAL_AGENT_MODEL", "anthropic:claude-sonnet-5-5")
+_PROVIDER_KEYS = {"anthropic": "ANTHROPIC_API_KEY", "fireworks": "FIREWORKS_API_KEY"}
+_KEY = _PROVIDER_KEYS.get(MODEL.split(":", 1)[0], "ANTHROPIC_API_KEY")
+pytest.importorskip(f"langchain_{MODEL.split(':', 1)[0]}")
+pytestmark = pytest.mark.skipif(not os.environ.get(_KEY), reason=f"set {_KEY}")
 
 TICKETS = {
     7: "Printer on floor 3 is jammed.",
@@ -131,6 +131,7 @@ def test_person_edits_the_delete(live) -> None:
     assert ran == ["delete(19)"]
 
 
+@pytest.mark.skipif(not os.environ.get("ANTHROPIC_API_KEY"), reason="set ANTHROPIC_API_KEY")
 def test_router_with_real_model_names(live) -> None:
     """The documented form: models given as `provider:name` strings (init_chat_model)."""
     from langchain_nace.experimental.middleware import ModelChoice, NaceModelRouterMiddleware

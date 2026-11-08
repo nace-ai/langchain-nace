@@ -16,7 +16,9 @@ jobs:
       NACE_API_KEY: ${{ secrets.NACE_API_KEY_LIVE }}
       OPENROUTER_API_KEY_LIVE: ${{ secrets.OPENROUTER_API_KEY_LIVE }}
       # Real LLMs drive the agent tests (Claude; gpt-oss-120b for the misbehaving-agent test).
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Real-agent tests run on Fireworks; the Claude-specific router test skips until
+      # a valid ANTHROPIC_API_KEY secret is added back here.
+      REAL_AGENT_MODEL: fireworks:accounts/fireworks/models/glm-5p3
       FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
     steps:
       - uses: actions/checkout@v4
