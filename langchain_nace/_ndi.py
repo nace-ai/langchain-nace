@@ -60,7 +60,8 @@ class NdiClient:
         """Resolve credentials and build the SDK client; configuration errors surface here.
 
         Raises:
-            ValueError: The endpoint is OpenRouter, carries userinfo, or the key is unusable.
+            ValueError: The endpoint is OpenRouter, is not an absolute http(s) URL,
+                carries userinfo, or the key is unusable.
 
         """
         explicit = NaceClassifier._blank_base_url_is_default(base_url)
@@ -72,10 +73,12 @@ class NdiClient:
         try:
             # HTTPX applies IDNA, so a host written with a Unicode dot also lands on
             # openrouter.ai; refuse that before the key lookup, as for the exact host.
-            host = httpx.URL(endpoint).host.removesuffix(".")
+            url = httpx.URL(endpoint)
         except httpx.InvalidURL as error:
             raise ValueError("base_url is not a valid URL.") from error
-        if _is_openrouter(endpoint) or host == "openrouter.ai":
+        if url.scheme not in ("http", "https") or not url.host:
+            raise ValueError("base_url must be an absolute http(s) URL.")
+        if _is_openrouter(endpoint) or url.host.removesuffix(".") == "openrouter.ai":
             message = "NDI is not available through OpenRouter; use a Nace endpoint."
             raise ValueError(message)
         # An explicit empty key stays "" (the SDK refuses it) instead of falling back to

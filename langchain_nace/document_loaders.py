@@ -20,6 +20,7 @@ from langchain_nace.errors import NaceError
 
 TRUNCATED = "content_truncated"
 _PARSE_ONLY = ("source", "chunking", "parse_mode")
+_LOADER_SETS = ("wait_seconds", "extra_body")
 
 
 @beta()
@@ -47,7 +48,8 @@ class NaceDocumentLoader(BaseLoader):
         file_name: File type of a URL source whose last path segment has no extension.
         workspace_id: Upload target for a local file; without it the file is uploaded
             to the server.
-        parse_kwargs: More Parse body fields; they replace the defaults.
+        parse_kwargs: More Parse body fields; they replace the defaults, so
+            `output={"formats": ["text"]}` returns the plain text instead of the Markdown.
         timeout: Seconds to wait for the job to finish.
         api_key: Nace API key. Defaults to `NACE_API_KEY` for the configured endpoint.
         base_url: API root. Defaults to `NACE_BASE_URL`, else `https://console.nace.ai`.
@@ -80,6 +82,10 @@ class NaceDocumentLoader(BaseLoader):
         for key in _PARSE_ONLY:
             if key in self.parse_kwargs:
                 message = f"parse_kwargs must not set {key!r}; use the loader's {key} argument."
+                raise ValueError(message)
+        for key in _LOADER_SETS:
+            if key in self.parse_kwargs:
+                message = f"parse_kwargs must not set {key!r}; the loader sets it."
                 raise ValueError(message)
         self.timeout = timeout
         self._ndi = NdiClient(
@@ -118,7 +124,7 @@ class NaceDocumentLoader(BaseLoader):
             "page_count": document.get("page_count"),
         }
         if self.chunking == "none":
-            markdown = document.get("markdown") or ""
+            markdown = document.get("markdown") or document.get("text") or ""
             truncated = any(
                 isinstance(item, dict) and item.get("code") == TRUNCATED
                 for item in result.get("disclosures") or []

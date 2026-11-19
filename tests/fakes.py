@@ -162,6 +162,8 @@ class FakeNdi:
     """
 
     markdown: str = "# Invoice INV-2026-0042\n\nTotal due: USD 400.00"
+    text: str | None = None
+    """The parse document's plain text (`output={"formats": ["text"]}`)."""
     full_markdown: str = (
         "# Invoice INV-2026-0042\n\nSeller: Example Supplies Ltd\n\nTotal due: USD 400.00"
     )
@@ -169,6 +171,8 @@ class FakeNdi:
     disclosures: list[dict[str, Any]] = field(default_factory=list)
     content_url: str | None = None
     output: dict[str, Any] = field(default_factory=fact_output)
+    stuck_queued: bool = False
+    """When True, every job read answers a queued job (wait-timeout tests)."""
     replies: dict[str, list[Reply | Callable[[dict[str, Any]], Reply]]] = field(
         default_factory=dict
     )
@@ -191,6 +195,7 @@ class FakeNdi:
             "result": {
                 "document": {
                     "markdown": self.markdown,
+                    "text": self.text,
                     "page_count": 2,
                     "chunks": self.chunks,
                     "content_url": self.content_url,
@@ -324,6 +329,8 @@ class FakeNdi:
         if route == "search":
             return 200, {}, self.search_job()
         if route == "job":
+            if self.stuck_queued:
+                return 200, {}, {"job_id": NDI_JOB_ID, "kind": "parse", "status": "queued"}
             return 200, {}, self.parse_job()
         if route == "job_delete":
             return 204, {}, None

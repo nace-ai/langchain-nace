@@ -12,6 +12,7 @@ from langchain_core.tools import ToolException
 from pydantic import ValidationError
 
 from langchain_nace import (
+    NaceAPITimeoutError,
     NaceDocumentLoader,
     NaceError,
     NaceExtractTool,
@@ -64,6 +65,22 @@ def test_loader_local_file_parses_and_cleans_up(ndi: FakeNdi, tmp_path: Path) ->
     assert grant.url.path == "/v1/documents/upload-grants"
     assert ndi.bodies[0]["path"].startswith("langchain-nace/")
     assert ndi.bodies[0]["path"].endswith("/invoice.html")
+    # A second load of the same file uploads under a new unique path, never the same file.
+    list(loader.lazy_load())
+    paths = [body["path"] for body in ndi.bodies if "path" in body]
+    assert len(paths) == 2
+    assert paths[0] != paths[1]
+    assert all(
+        path.startswith("langchain-nace/") and path.endswith("/invoice.html") for path in paths
+    )
+    # Plain text output returns the text instead of the Markdown.
+    ndi.markdown = None
+    ndi.text = "Invoice INV-2026-0042 in plain text"
+    text_loader = NaceDocumentLoader(
+        path, parse_kwargs={"output": {"formats": ["text"]}}, **options(ndi)
+    )
+    [text_doc] = list(text_loader.lazy_load())
+    assert text_doc.page_content == "Invoice INV-2026-0042 in plain text"
     assert upload.url.host == "upload.ndi.test"
     assert upload.headers["x-upload-token"] == "upl_FAKE_FOR_TEST"
     assert "authorization" not in upload.headers
@@ -161,19 +178,44 @@ def test_failed_job_raises_and_still_cleans_up(ndi: FakeNdi, tmp_path: Path) -> 
     ]
 
 
+def test_wait_timeout_raises_and_cancels_the_job(ndi: FakeNdi) -> None:
+    ndi.stuck_queued = True
+    ndi.queue("parse", (202, {}, {"job_id": NDI_JOB_ID, "kind": "parse", "status": "queued"}))
+    loader = NaceDocumentLoader(
+        "https://cdn.test/invoice.html", timeout=0.2, **options(ndi)
+    )
+    with pytest.raises(NaceAPITimeoutError, match="did not finish"):
+        list(loader.lazy_load())
+    # The wait budget ran out, but the stuck job is still cancelled.
+    last = ndi.requests[-1]
+    assert (last.method, last.url.path) == ("DELETE", f"/v1/documents/jobs/{NDI_JOB_ID}")
+
+
 def test_api_error_is_converted_and_redacted(ndi: FakeNdi) -> None:
-    ndi.queue("parse", error(422, "chunking.strategy: unknown strategy"))
-    loader = NaceDocumentLoader("https://cdn.test/invoice.html", **options(ndi))
+    # An opaque key the generic redaction patterns would not match: only the secrets
+    # passed to `convert_error` by `NdiClient.call` can redact it.
+    opaque = "opaque-FAKE-key-for-test"
+    ndi.queue("parse", error(422, f"chunking.strategy: unknown strategy (key {opaque})"))
+    loader = NaceDocumentLoader(
+        "https://cdn.test/invoice.html", **{**options(ndi), "api_key": opaque}
+    )
     with pytest.raises(NaceUnprocessableEntityError) as excinfo:
         list(loader.lazy_load())
     assert "unknown strategy" in str(excinfo.value)
-    assert KEY not in str(excinfo.value)
+    assert opaque not in str(excinfo.value)
+    assert "[REDACTED]" in str(excinfo.value)
 
 
 def test_configuration_rules(ndi: FakeNdi, monkeypatch: pytest.MonkeyPatch) -> None:
-    for url in ("https://openrouter.ai/api/v1", "https://openrouter.ai./api/v1", "https://openrouter。ai/api"):
+    for url in (
+        "https://openrouter.ai/api/v1",
+        "https://openrouter.ai./api/v1",
+        "https://openrouter。ai/api",
+    ):
         with pytest.raises(ValueError, match="OpenRouter"):
             NaceDocumentLoader("https://cdn.test/invoice.html", **{**options(ndi), "base_url": url})
+    with pytest.raises(ValueError, match="absolute"):
+        NaceDocumentLoader("https://cdn.test/invoice.html", **{**options(ndi), "base_url": "/api"})
     monkeypatch.setenv("NACE_API_KEY", KEY)
     monkeypatch.setenv("NACE_BASE_URL", "https://openrouter.ai/api")
     with pytest.raises(ValueError, match="OpenRouter"):
@@ -195,6 +237,12 @@ def test_configuration_rules(ndi: FakeNdi, monkeypatch: pytest.MonkeyPatch) -> N
         NaceDocumentLoader(
             "https://cdn.test/invoice.html",
             parse_kwargs={"chunking": {"strategy": "none"}},
+            **options(ndi),
+        )
+    with pytest.raises(ValueError, match="extra_body"):
+        NaceDocumentLoader(
+            "https://cdn.test/invoice.html",
+            parse_kwargs={"extra_body": {}},
             **options(ndi),
         )
     with pytest.raises(ValidationError, match="workspace_id") as as_error:

@@ -80,11 +80,13 @@ def test_real_agent_calls_the_extract_tool() -> None:
         pytest.skip(f"set {_PROVIDER_KEY}")
     tool = NaceExtractTool(extraction_schema=SCHEMA, allow_local_files=True, **ndi_options())
     agent = create_agent(MODEL, tools=[tool])
+    # A relative path: the prompt carries no machine-specific directory.
+    path = os.path.relpath(FIXTURE)
     result = agent.invoke(
         {
             "messages": [
                 HumanMessage(
-                    f"Extract the fields from the invoice at {FIXTURE} with the extract "
+                    f"Extract the fields from the invoice at {path} with the extract "
                     "tool, then tell me the invoice number."
                 )
             ]
