@@ -11,10 +11,10 @@
   <a href="https://github.com/nace-ai/langchain-nace/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
 </p>
 
-LangChain integration for [Drex](https://console.nace.ai/docs), Nace's decision models. Drex reads text, JSON, LangChain messages and (on Drex Max) images, and returns typed answers with calibrated probabilities instead of generated text. Use it to route requests, pick models, or check tool calls before they run.
+LangChain integration for [Drex](https://console.nace.ai/docs), Nace's decision models, and for Nace Document Intelligence (NDI): a document loader, an extraction tool and a workspace search tool. Drex reads text, JSON, LangChain messages and (on Drex Max) images, and returns typed answers with calibrated probabilities instead of generated text. Use it to route requests, pick models, or check tool calls before they run.
 
 ```bash
-pip install langchain-nace                  # classifier, router, LangGraph edge
+pip install langchain-nace                  # classifier, router, loader, tools, LangGraph edge
 pip install "langchain-nace[experimental]"  # + agent middleware
 export NACE_API_KEY=nace_sk_...
 ```
@@ -108,6 +108,39 @@ chain = router.branch(
 ```
 
 LangGraph: `nace_conditional_edge(classifier, question, state=..., min_confidence=0.7)` is a path function for `add_conditional_edges`. Below the threshold it returns `"human_review"`, so that node can `interrupt()` for a person. See [`examples/langgraph_router.py`](https://github.com/nace-ai/langchain-nace/blob/main/examples/langgraph_router.py).
+
+## Documents (NDI)
+
+Nace Document Intelligence (NDI) is the document side of the same API: it parses documents to Markdown, extracts structured fields and answers questions over the files in a workspace. It is cloud only, and uses the same `NACE_API_KEY` as Drex.
+
+```python
+from langchain_nace import NaceDocumentLoader, NaceExtractTool, NaceSearchTool
+
+loader = NaceDocumentLoader("invoice.pdf", chunking="page")  # or a public https:// URL
+pages = loader.load()
+
+extract = NaceExtractTool(
+    extraction_schema={
+        "type": "object",
+        "properties": {"invoice_number": {"type": "string"}, "total": {"type": "number"}},
+    },
+    instructions="Extract the billing fields.",
+)
+
+search = NaceSearchTool(workspace_id="...")  # an ingested workspace
+answer = search.invoke({"name": "nace_search", "args": {"query": "What is the total due?"},
+                        "id": "call_1", "type": "tool_call"})
+```
+
+The loader yields one `Document` for the whole Markdown (`chunking="none"`), or one per page or section (`chunking="page"`/`"section"`), with `source`, `job_id`, `page_count` (and `chunk_id`, `page`) in the metadata. The extract tool returns, for each field, its status (`found`, `not_found` or `ambiguous`), confidence and the quoted source text; the search tool returns the answer, its confidence and the evidence it cites. Both tools are `content_and_artifact` tools: the artifact is the raw job result.
+
+Rules:
+
+- The loader and the extract tool delete the uploaded file and the job after the read; the search tool deletes its job. A failed clean-up is logged, not raised.
+- `allow_local_files` is off by default because the model controls the tool input: only public `https://` URLs are accepted unless you opt in.
+- The extraction schema is a JSON Schema subset (no `$ref`, `anyOf` or `format`); pass it as a `dict`.
+- There is no retriever: NDI search returns one generated answer and the quotes it cites, not ranked passages or scores. A retriever built on evidences would give a second LLM a partial, unranked context and would hide the answer NDI already made, so the honest slot is an agent tool that returns the answer with its citations.
+- NDI is not available through OpenRouter; the credential rules of the [Backends](#backends) section apply.
 
 ## Agent middleware (experimental)
 
