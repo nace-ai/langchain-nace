@@ -308,6 +308,8 @@ def test_extract_tool_returns_fields_quotes_and_artifact(ndi: FakeNdi, tmp_path:
     assert len(ndi.requests) == sent
     # Opting in accepts local files; a missing one is still a ToolException, no request.
     local = NaceExtractTool(extraction_schema=SCHEMA, allow_local_files=True, **options(ndi))
+    assert "local file" in local.description
+    assert "local file" not in tool.description
     missing = str(tmp_path / "missing.html")
     with pytest.raises(ToolException, match="No such file"):
         local.invoke({**TOOL_CALL, "args": {"source": missing}, "id": "call_3"})

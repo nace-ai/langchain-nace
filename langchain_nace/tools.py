@@ -18,6 +18,10 @@ EXTRACT_DESCRIPTION = (
     "document. Returns the extracted data and, for each field, its status (found, "
     "not_found or ambiguous), confidence and the quoted source text."
 )
+EXTRACT_DESCRIPTION_LOCAL = EXTRACT_DESCRIPTION.replace(
+    "Input: the public https URL of the document.",
+    "Input: the https URL of the document, or the path of a local file.",
+)
 SEARCH_DESCRIPTION = (
     "Answer a question from the files in a Nace workspace. Returns the answer, its "
     "confidence and the evidence it cites (file path, page, quote). It searches the "
@@ -26,7 +30,10 @@ SEARCH_DESCRIPTION = (
 
 
 class _ExtractInput(BaseModel):
-    source: str = Field(description="The public https:// URL of the document.")
+    source: str = Field(
+        description="The https:// URL of the document (or a local file path, if the tool "
+        "description permits local files)."
+    )
 
 
 class _SearchInput(BaseModel):
@@ -106,6 +113,14 @@ class NaceExtractTool(_NdiTool):
     parse_mode: Literal["low", "medium", "high"] = "low"
     allow_local_files: bool = False
     workspace_id: str | None = None
+
+    def model_post_init(self, context: Any, /) -> None:
+        """Build the client and make the description match `allow_local_files`."""
+        super().model_post_init(context)
+        # The model reads the description: it must not say "URL only" when local
+        # files are permitted, or the model refuses a path the developer allowed.
+        if self.allow_local_files and self.description == EXTRACT_DESCRIPTION:
+            self.description = EXTRACT_DESCRIPTION_LOCAL
 
     def _run(
         self, source: str, run_manager: CallbackManagerForToolRun | None = None
