@@ -90,7 +90,10 @@ class NdiClient:
         http = http_client or httpx.Client(timeout=MIN_TIMEOUT)
         if _set_user_agent not in http.event_hooks["request"]:
             http.event_hooks["request"].append(_set_user_agent)
-        self._secrets = tuple(secret for secret in (key, read_env(API_KEY_ENV)) if secret)
+        # The SDK sends the key stripped, so that is the form an error could echo.
+        self._secrets = tuple(
+            secret.strip() for secret in (key, read_env(API_KEY_ENV)) if secret and secret.strip()
+        )
         try:
             self._client = nace_sdk.NaceClient(
                 api_key=key,

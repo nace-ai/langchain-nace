@@ -124,6 +124,12 @@ class NaceDocumentLoader(BaseLoader):
             "page_count": document.get("page_count"),
         }
         if self.chunking == "none":
+            if document.get("markdown") is None and document.get("text") is None:
+                message = (
+                    "The parse result has no Markdown or text; keep 'markdown' or 'text' "
+                    "in output.formats."
+                )
+                raise NaceError(message)
             markdown = document.get("markdown") or document.get("text") or ""
             truncated = any(
                 isinstance(item, dict) and item.get("code") == TRUNCATED

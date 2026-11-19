@@ -81,6 +81,10 @@ def test_loader_local_file_parses_and_cleans_up(ndi: FakeNdi, tmp_path: Path) ->
     )
     [text_doc] = list(text_loader.lazy_load())
     assert text_doc.page_content == "Invoice INV-2026-0042 in plain text"
+    # Neither rendering requested: an error, not an empty document.
+    ndi.text = None
+    with pytest.raises(NaceError, match=r"output\.formats"):
+        list(text_loader.lazy_load())
     assert upload.url.host == "upload.ndi.test"
     assert upload.headers["x-upload-token"] == "upl_FAKE_FOR_TEST"
     assert "authorization" not in upload.headers
@@ -197,7 +201,8 @@ def test_api_error_is_converted_and_redacted(ndi: FakeNdi) -> None:
     opaque = "opaque-FAKE-key-for-test"
     ndi.queue("parse", error(422, f"chunking.strategy: unknown strategy (key {opaque})"))
     loader = NaceDocumentLoader(
-        "https://cdn.test/invoice.html", **{**options(ndi), "api_key": opaque}
+        # A key read from a file often ends in a newline; the SDK sends it stripped.
+        "https://cdn.test/invoice.html", **{**options(ndi), "api_key": opaque + "\n"}
     )
     with pytest.raises(NaceUnprocessableEntityError) as excinfo:
         list(loader.lazy_load())
