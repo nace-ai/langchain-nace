@@ -137,7 +137,9 @@ The loader yields one `Document` for the whole Markdown (`chunking="none"`), or 
 Rules:
 
 - The loader and the extract tool delete the uploaded file and the job after the read; the search tool deletes its job. A failed clean-up is logged, not raised.
-- `allow_local_files` is off by default because the model controls the tool input: only public `https://` URLs are accepted unless you opt in.
+- Local files are uploaded under a unique path `langchain-nace/<id>/<name>`, and that upload is deleted after the read.
+- `allow_local_files` is off by default because the model controls the tool input: only `https://` URLs are accepted (NDI fetches the URL from its own servers), and local paths are refused unless you opt in.
+- A supplied `http_client` is also used for the upload and download hosts, so do not put credentials in its default headers.
 - The extraction schema is a JSON Schema subset (no `$ref`, `anyOf` or `format`); pass it as a `dict`.
 - There is no retriever: NDI search returns one generated answer and the quotes it cites, not ranked passages or scores. A retriever built on evidences would give a second LLM a partial, unranked context and would hide the answer NDI already made, so the honest slot is an agent tool that returns the answer with its citations.
 - NDI is not available through OpenRouter; the credential rules of the [Backends](#backends) section apply.

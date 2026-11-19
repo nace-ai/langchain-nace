@@ -16,8 +16,10 @@ from nace_sdk import DocumentJob
 from pydantic import SecretStr
 
 from langchain_nace._ndi import DEFAULT_JOB_TIMEOUT, NdiClient, Source
+from langchain_nace.errors import NaceError
 
 TRUNCATED = "content_truncated"
+_PARSE_ONLY = ("source", "chunking", "parse_mode")
 
 
 @beta()
@@ -75,6 +77,10 @@ class NaceDocumentLoader(BaseLoader):
         self.file_name = file_name
         self.workspace_id = workspace_id
         self.parse_kwargs = dict(parse_kwargs) if parse_kwargs else {}
+        for key in _PARSE_ONLY:
+            if key in self.parse_kwargs:
+                message = f"parse_kwargs must not set {key!r}; use the loader's {key} argument."
+                raise ValueError(message)
         self.timeout = timeout
         self._ndi = NdiClient(
             api_key=api_key, base_url=base_url, max_retries=max_retries, http_client=http_client
@@ -107,7 +113,7 @@ class NaceDocumentLoader(BaseLoader):
         raw_document = result.get("document")
         document = raw_document if isinstance(raw_document, dict) else {}
         metadata: dict[str, Any] = {
-            "source": str(self.source),
+            "source": self.source if isinstance(self.source, str) else os.fspath(self.source),
             "job_id": job.job_id,
             "page_count": document.get("page_count"),
         }
@@ -117,7 +123,11 @@ class NaceDocumentLoader(BaseLoader):
                 isinstance(item, dict) and item.get("code") == TRUNCATED
                 for item in result.get("disclosures") or []
             )
-            if truncated and document.get("content_url"):
+            if truncated:
+                if not document.get("content_url"):
+                    raise NaceError(
+                        "The parse result is truncated and has no content_url for the full text."
+                    )
                 markdown = self._full_markdown(job.job_id, document["content_url"])
             return [Document(page_content=markdown, metadata=metadata)]
         documents = []

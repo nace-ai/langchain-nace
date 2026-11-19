@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 from langchain_core.tools import ToolException
+from pydantic import ValidationError
 
 from langchain_nace import (
     NaceDocumentLoader,
@@ -61,6 +62,8 @@ def test_loader_local_file_parses_and_cleans_up(ndi: FakeNdi, tmp_path: Path) ->
     assert doc.metadata == {"source": str(path), "job_id": NDI_JOB_ID, "page_count": 2}
     grant, upload, parse, *rest = ndi.requests
     assert grant.url.path == "/v1/documents/upload-grants"
+    assert ndi.bodies[0]["path"].startswith("langchain-nace/")
+    assert ndi.bodies[0]["path"].endswith("/invoice.html")
     assert upload.url.host == "upload.ndi.test"
     assert upload.headers["x-upload-token"] == "upl_FAKE_FOR_TEST"
     assert "authorization" not in upload.headers
@@ -124,6 +127,13 @@ def test_loader_returns_full_markdown_when_truncated(ndi: FakeNdi) -> None:
     assert doc.page_content == ndi.full_markdown
     [download] = [r for r in ndi.requests if r.url.path.endswith("/content")]
     assert download.headers["authorization"] == f"Bearer {KEY}"
+    # A truncated result without a content_url cannot be completed: say so, not the preview.
+    ndi.content_url = None
+    loader = NaceDocumentLoader(
+        "https://cdn.test/invoice", file_name="invoice.html", **options(ndi)
+    )
+    with pytest.raises(NaceError, match="content_url"):
+        list(loader.lazy_load())
 
 
 def test_failed_job_raises_and_still_cleans_up(ndi: FakeNdi, tmp_path: Path) -> None:
@@ -161,7 +171,7 @@ def test_api_error_is_converted_and_redacted(ndi: FakeNdi) -> None:
 
 
 def test_configuration_rules(ndi: FakeNdi, monkeypatch: pytest.MonkeyPatch) -> None:
-    for url in ("https://openrouter.ai/api/v1", "https://openrouter.ai./api/v1"):
+    for url in ("https://openrouter.ai/api/v1", "https://openrouter.ai./api/v1", "https://openrouter。ai/api"):
         with pytest.raises(ValueError, match="OpenRouter"):
             NaceDocumentLoader("https://cdn.test/invoice.html", **{**options(ndi), "base_url": url})
     monkeypatch.setenv("NACE_API_KEY", KEY)
@@ -181,6 +191,15 @@ def test_configuration_rules(ndi: FakeNdi, monkeypatch: pytest.MonkeyPatch) -> N
         list(NaceDocumentLoader("http://cdn.test/invoice.html", **options(ndi)).lazy_load())
     with pytest.raises(ValueError, match="file_name"):
         list(NaceDocumentLoader("https://cdn.test/invoice", **options(ndi)).lazy_load())
+    with pytest.raises(ValueError, match="chunking"):
+        NaceDocumentLoader(
+            "https://cdn.test/invoice.html",
+            parse_kwargs={"chunking": {"strategy": "none"}},
+            **options(ndi),
+        )
+    with pytest.raises(ValidationError, match="workspace_id") as as_error:
+        NaceSearchTool(api_key=KEY, base_url="https://ndi.test")
+    assert KEY not in str(as_error.value)
     assert ndi.requests == []
     monkeypatch.setenv("NACE_API_KEY", "nace_sk_FAKE_OTHER_ENDPOINT")
     monkeypatch.setenv("NACE_BASE_URL", "https://other.ndi.test")
@@ -193,6 +212,16 @@ def test_configuration_rules(ndi: FakeNdi, monkeypatch: pytest.MonkeyPatch) -> N
     assert str(parse_request.url).startswith("https://other.ndi.test/v1/documents/parse")
     assert parse_request.headers["authorization"] == "Bearer nace_sk_FAKE_OTHER_ENDPOINT"
     assert all(r.url.host == "other.ndi.test" for r in rest)
+    # A whitespace-only explicit base_url means "use the environment", like the classifier.
+    monkeypatch.setenv("NACE_BASE_URL", "https://blank.ndi.test")
+    blank = NaceDocumentLoader(
+        "https://cdn.test/invoice.html",
+        base_url="   ",
+        http_client=httpx.Client(transport=ndi.transport()),
+    )
+    [doc] = list(blank.lazy_load())
+    assert "INV-2026-0042" in doc.page_content
+    assert all(r.url.host == "blank.ndi.test" for r in ndi.requests[2:])
 
 
 def test_extract_tool_returns_fields_quotes_and_artifact(ndi: FakeNdi, tmp_path: Path) -> None:
@@ -270,7 +299,5 @@ def test_cleanup_failure_warns_but_keeps_the_result(
             {**TOOL_CALL, "args": {"source": "https://cdn.test/invoice.html"}, "id": "call_1"}
         )
     assert json.loads(message.content)["data"]["invoice_number"] == "INV-2026-0042"
-    assert any(
-        "job" in record.getMessage() and NDI_JOB_ID in record.getMessage()
-        for record in caplog.records
-    )
+    [record] = caplog.records
+    assert record.getMessage() == f"Could not delete the NDI job {NDI_JOB_ID}."

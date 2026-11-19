@@ -16,7 +16,7 @@ from langchain_nace import NaceDocumentLoader, NaceExtractTool, NaceSearchTool
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "invoice.html"
 KEY = os.environ.get("NACE_API_KEY_LIVE")
-BASE_URL = os.environ.get("NACE_BASE_URL_LIVE") or None  # unset or empty = prod
+BASE_URL = os.environ.get("NACE_BASE_URL_LIVE") or "https://console.nace.ai"  # unset = prod
 SCHEMA = {
     "type": "object",
     "properties": {

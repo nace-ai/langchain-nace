@@ -9,7 +9,7 @@ import httpx
 from langchain_core._api import beta
 from langchain_core.callbacks import CallbackManagerForToolRun
 from langchain_core.tools import BaseTool, ToolException
-from pydantic import BaseModel, Field, PrivateAttr, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SecretStr
 
 from langchain_nace._ndi import DEFAULT_JOB_TIMEOUT, NdiClient
 
@@ -35,6 +35,10 @@ class _SearchInput(BaseModel):
 
 class _NdiTool(BaseTool):
     """Fields the NDI tools share: credentials, endpoint, HTTP and job settings."""
+
+    # Pydantic merges this with BaseTool's config, so arbitrary types stay allowed; the
+    # input kwargs (which may hold the api key) stay out of validation error messages.
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
     base_url: str | None = None

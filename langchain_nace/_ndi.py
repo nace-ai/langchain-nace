@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, TypeVar
@@ -62,13 +63,19 @@ class NdiClient:
             ValueError: The endpoint is OpenRouter, carries userinfo, or the key is unusable.
 
         """
+        explicit = NaceClassifier._blank_base_url_is_default(base_url)
         endpoint = (
-            NaceClassifier._blank_base_url_is_default(
-                base_url or read_env(BASE_URL_ENV) or DEFAULT_BASE_URL
-            )
+            explicit
+            or NaceClassifier._blank_base_url_is_default(read_env(BASE_URL_ENV))
             or DEFAULT_BASE_URL
         )
-        if _is_openrouter(endpoint):
+        try:
+            # HTTPX applies IDNA, so a host written with a Unicode dot also lands on
+            # openrouter.ai; refuse that before the key lookup, as for the exact host.
+            host = httpx.URL(endpoint).host.removesuffix(".")
+        except httpx.InvalidURL as error:
+            raise ValueError("base_url is not a valid URL.") from error
+        if _is_openrouter(endpoint) or host == "openrouter.ai":
             message = "NDI is not available through OpenRouter; use a Nace endpoint."
             raise ValueError(message)
         # An explicit empty key stays "" (the SDK refuses it) instead of falling back to
@@ -114,7 +121,7 @@ class NdiClient:
             ValueError: The URL is not `https://`, has no file type, or the file is missing.
 
         """
-        text = str(source)
+        text = source if isinstance(source, str) else os.fspath(source)
         if "://" in text:
             if not text.startswith("https://"):
                 raise ValueError("Only https:// URLs are supported.")
@@ -129,11 +136,17 @@ class NdiClient:
             return
         if not os.path.isfile(text):
             raise ValueError(f"No such file: {text}")
-        uploaded = self.call(
-            lambda client: client.documents.upload(
-                text, file_name=file_name, workspace_id=workspace_id
+        # Upload under a unique path: the same bytes at a fixed path resolve to the file
+        # that is already there, so two loads of one file would share (and delete) it.
+        upload_path = f"langchain-nace/{uuid.uuid4().hex}/{file_name or os.path.basename(text)}"
+        try:
+            uploaded = self.call(
+                lambda client: client.documents.upload(
+                    text, path=upload_path, file_name=file_name, workspace_id=workspace_id
+                )
             )
-        )
+        except OSError:
+            raise ValueError(f"Cannot read the file: {text}") from None
         try:
             yield uploaded.as_source()
         finally:
