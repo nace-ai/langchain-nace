@@ -3,7 +3,7 @@
 Notable changes per release. Versions before 0.2.0 have no changelog entry; the
 [commit history](https://github.com/nace-ai/langchain-nace/commits/main) covers them.
 
-## 0.2.0 (unreleased)
+## 0.2.0 - 2026-11-20
 
 ### Added — Nace Document Intelligence (NDI)
 
