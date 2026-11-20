@@ -2,17 +2,21 @@
 
 Every `nace_sdk` call the NDI components make goes through `NdiClient`, so the credential
 rules of `NaceClassifier` (endpoint-bound key, OpenRouter refusal, redaction) apply to
-them unchanged.
+them unchanged. A component's `timeout` bounds its whole job: the create request, the
+wait and a truncated-content download.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from pathlib import Path
+from queue import Empty, Queue
 from typing import Any, TypeVar
 from urllib.parse import unquote, urlsplit
 
@@ -31,6 +35,7 @@ from langchain_nace.classifier import (
 )
 from langchain_nace.errors import (
     MAX_MESSAGE_CHARS,
+    NaceAPIError,
     NaceAPITimeoutError,
     NaceError,
     _redact,
@@ -43,7 +48,83 @@ PROVIDER = "NDI"
 DEFAULT_JOB_TIMEOUT = 300.0
 Source = str | os.PathLike[str]
 
+#: The largest hold a create asks the server for (the SDK's cap).
+CREATE_HOLD_CAP = 60
+#: The largest hold a job read asks the server for (the SDK's cap).
+MAX_HOLD_SECONDS = 25
+#: The SDK raises a held read's HTTP timeout to at least this many seconds, so below
+#: this much budget left the poll loop reads without a hold instead.
+HELD_READ_FLOOR = 95.0
+#: An unheld poll waits this long before asking again, doubling up to the maximum.
+POLL_SECONDS = 1.0
+MAX_POLL_SECONDS = 10.0
+
 T = TypeVar("T")
+
+#: The SDK emits its wire log, with request and response bodies, on this logger.
+SDK_LOGGER_NAME = "nace_sdk"
+
+
+class _SdkLogRedactor(logging.Filter):
+    """Redact the keys NDI clients were configured with from `nace_sdk` log records.
+
+    The SDK's own filter masks credential headers and known secret body fields, but a
+    server can echo a key inside an error message; this filter removes the configured
+    keys from the rendered text of every record. It is attached after the SDK's filter,
+    so bodies are already rendered as strings when it runs.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._secrets: tuple[str, ...] = ()
+
+    def add_secrets(self, secrets: Sequence[str]) -> None:
+        """Remember more keys to redact; called as clients are configured."""
+        if secrets:
+            self._secrets = self._secrets + tuple(secrets)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Redact the configured keys from a record's message and arguments."""
+        secrets = self._secrets
+        if not secrets:
+            return True
+        if isinstance(record.msg, str):
+            record.msg = _redact(record.msg, secrets)
+        args = record.args
+        if isinstance(args, tuple):
+            record.args = tuple(
+                _redact(arg, secrets) if isinstance(arg, str) else arg for arg in args
+            )
+        elif isinstance(args, dict):
+            record.args = {
+                key: _redact(value, secrets) if isinstance(value, str) else value
+                for key, value in args.items()
+            }
+        return True
+
+
+_SDK_LOG_REDACTOR = _SdkLogRedactor()
+
+
+def _redact_body(value: Any, secrets: Sequence[str]) -> Any:
+    """Redact every string inside a JSON-like error body."""
+    if isinstance(value, str):
+        return _redact(value, secrets)
+    if isinstance(value, dict):
+        return {key: _redact_body(item, secrets) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_body(item, secrets) for item in value]
+    return value
+
+
+def _is_job_pending(error: NaceAPIError) -> bool:
+    """Whether a failed document create may still run server-side.
+
+    The SDK documents the case: a `503` with code `job_pending` (always carrying an
+    `Idempotency-Key`, as every create does) may still start the job, and resending
+    the same body with that key resumes it instead of starting another.
+    """
+    return error.status == 503 and error.code == "job_pending" and error.idempotency_key is not None
 
 
 class NdiClient:
@@ -56,8 +137,12 @@ class NdiClient:
         base_url: str | None = None,
         max_retries: int = 2,
         http_client: httpx.Client | None = None,
+        retry_timeout: float | None = None,
     ) -> None:
         """Resolve credentials and build the SDK client; configuration errors surface here.
+
+        `retry_timeout` bounds each SDK call's retries (attempts plus backoff), so a
+        busy server cannot retry a request past the component's job budget.
 
         Raises:
             ValueError: The endpoint is OpenRouter, is not an absolute http(s) URL,
@@ -94,11 +179,19 @@ class NdiClient:
         self._secrets = tuple(
             secret.strip() for secret in (key, read_env(API_KEY_ENV)) if secret and secret.strip()
         )
+        self._max_retries = max_retries
+        # A server can echo a key inside an error body, and the SDK's DEBUG wire log
+        # prints that body verbatim (its own filter masks only credential headers and
+        # secret body fields); keep the configured keys out of that log too.
+        _SDK_LOG_REDACTOR.add_secrets(self._secrets)
+        sdk_logger = logging.getLogger(SDK_LOGGER_NAME)
+        if _SDK_LOG_REDACTOR not in sdk_logger.filters:
+            sdk_logger.addFilter(_SDK_LOG_REDACTOR)
         try:
             self._client = nace_sdk.NaceClient(
                 api_key=key,
                 base_url=endpoint,
-                retry=nace_sdk.RetryPolicy(max_retries=max_retries, timeout=None),
+                retry=nace_sdk.RetryPolicy(max_retries=max_retries, timeout=retry_timeout),
                 timeout=MIN_TIMEOUT,
                 client_info=CLIENT_NAME,
                 http_client=http,
@@ -111,7 +204,17 @@ class NdiClient:
         try:
             return fn(self._client)
         except nace_sdk.NaceError as error:
-            raise convert_error(error, PROVIDER, secrets=self._secrets) from None
+            converted = convert_error(error, PROVIDER, secrets=self._secrets)
+            if isinstance(converted, NaceAPIError):
+                # The wrapper keeps the upstream body for inspection; redact it like
+                # the message, so a key the server echoed does not survive there.
+                converted.body = _redact_body(converted.body, self._secrets)
+            try:
+                raise converted from None
+            finally:
+                # Raising inside this handler re-attaches the raw SDK error, whose
+                # body and message can echo a key; detach it again.
+                converted.__context__ = None
 
     @contextmanager
     def source(
@@ -153,26 +256,54 @@ class NdiClient:
             )
         except OSError:
             raise ValueError(f"Cannot read the file: {text}") from None
+        keep_file = False
         try:
             yield uploaded.as_source()
-        finally:
-            try:
-                self.call(
-                    lambda client: client.documents.delete_file(
-                        uploaded.workspace_id, uploaded.file_id
-                    )
+        except NaceAPIError as error:
+            if _is_job_pending(error):
+                # The pending job and its documented replay need the uploaded file:
+                # keep it, and tell the user where it is and how to delete it.
+                kept = (
+                    f"The uploaded NDI file was kept (workspace {uploaded.workspace_id}, "
+                    f"file {uploaded.file_id}): a 503 job_pending may still run, and "
+                    f"replaying it with idempotency key {error.idempotency_key} needs "
+                    "the file. Delete it with nace_sdk once you are done retrying: "
+                    f"client.documents.delete_file({uploaded.workspace_id!r}, "
+                    f"{uploaded.file_id!r})."
                 )
-            except Exception:
-                logger.warning("Could not delete the uploaded NDI file %s.", uploaded.file_id)
+                error.args = (f"{error}\n{kept}",)
+                keep_file = True
+            raise
+        finally:
+            if not keep_file:
+                try:
+                    self.call(
+                        lambda client: client.documents.delete_file(
+                            uploaded.workspace_id, uploaded.file_id
+                        )
+                    )
+                except Exception:
+                    logger.warning("Could not delete the uploaded NDI file %s.", uploaded.file_id)
 
     @contextmanager
     def job(
         self,
-        create: Callable[[nace_sdk.NaceClient, int], nace_sdk.DocumentJob],
+        create: Callable[[nace_sdk.NaceClient, int | None, float], nace_sdk.DocumentJob],
         *,
         timeout: float,
     ) -> Iterator[nace_sdk.DocumentJob]:
         """Run one document job to a terminal state and delete it, also on failure.
+
+        `timeout` bounds the whole job, the create request included. The create's hold
+        and its HTTP timeout share the budget (the SDK extends the request's timeout
+        by the hold), and every poll carries the time left as its HTTP timeout, with
+        its retries stopped at the same point, so no request can outlast the deadline
+        and none is sent after it. A job that is not done by then raises
+        `NaceAPITimeoutError`, and the clean-up cancels it.
+
+        `create` receives the SDK client, the `wait_seconds` its request asks the
+        server to hold (`None` when the budget is shorter than the one-second minimum),
+        and the per-call HTTP timeout.
 
         Raises:
             ValueError: `timeout` is not positive.
@@ -183,24 +314,19 @@ class NdiClient:
         if timeout <= 0:
             message = "timeout must be a positive number of seconds."
             raise ValueError(message)
-        wait_seconds = max(1, min(60, int(timeout)))
-        started = time.monotonic()
-        job = self.call(lambda client: create(client, wait_seconds))
+        deadline = time.monotonic() + timeout
+        # The hold and the HTTP timeout share the budget: the SDK extends the
+        # request's timeout by the hold, so `timeout - hold` caps the request at the
+        # budget. A budget under two seconds asks for no hold at all.
+        wait_seconds = min(CREATE_HOLD_CAP, int(timeout / 2)) or None
+        job = self.call(lambda client: create(client, wait_seconds, timeout - (wait_seconds or 0)))
         try:
             if not job.is_terminal:
-                remaining = max(timeout - (time.monotonic() - started), 0.0)
-
-                def finish(client: nace_sdk.NaceClient) -> nace_sdk.DocumentJob:
-                    try:
-                        return client.jobs.wait(
-                            job.job_id, timeout=remaining, raise_on_failure=False
-                        )
-                    except nace_sdk.NaceJobTimeoutError:
-                        raise NaceAPITimeoutError(
-                            f"The NDI job {job.job_id} did not finish in {timeout:g} s."
-                        ) from None
-
-                job = self.call(finish)
+                job = self._poll(job, deadline=deadline, timeout=timeout)
+            if time.monotonic() > deadline:
+                raise NaceAPITimeoutError(
+                    f"The NDI job {job.job_id} did not finish in {timeout:g} s."
+                )
             if job.status != "succeeded":
                 detail = ": ".join(
                     str(part) for part in (job.error_code, job.error_message) if part
@@ -213,3 +339,79 @@ class NdiClient:
                 self.call(lambda client: client.jobs.delete(job.job_id))
             except Exception:
                 logger.warning("Could not delete the NDI job %s.", job.job_id)
+
+    def _bounded_retry(self, budget: float) -> nace_sdk.RetryPolicy:
+        """The configured retries, stopped before they reach `budget` seconds."""
+        return nace_sdk.RetryPolicy(max_retries=self._max_retries, timeout=budget)
+
+    def _read(self, job_id: str, *, hold: int, timeout: float) -> nace_sdk.DocumentJob:
+        """One job read: held `hold` seconds at most, with HTTP timeout and retries in `timeout`."""
+        return self.call(
+            lambda client: client.jobs.get(
+                job_id, wait_seconds=hold, timeout=timeout, retry=self._bounded_retry(timeout)
+            )
+        )
+
+    def _poll(
+        self, job: nace_sdk.DocumentJob, *, deadline: float, timeout: float
+    ) -> nace_sdk.DocumentJob:
+        """Read the job until it is terminal, never reading past `deadline`.
+
+        While at least the SDK's floor for held reads remains, each read asks the
+        server to hold the job and carries the time left as its HTTP timeout. Below
+        that floor the SDK would raise a held read's timeout back to the floor, so the
+        loop polls without a hold, backing off from one second to ten between reads.
+        """
+        interval = POLL_SECONDS
+        while not job.is_terminal:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise NaceAPITimeoutError(
+                    f"The NDI job {job.job_id} did not finish in {timeout:g} s."
+                )
+            hold = min(MAX_HOLD_SECONDS, int(remaining)) if remaining >= HELD_READ_FLOOR else 0
+            job = self._read(job.job_id, hold=hold, timeout=remaining)
+            if job.is_terminal:
+                break
+            time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+            interval = min(interval * 2, MAX_POLL_SECONDS)
+        return job
+
+    def download(self, job_id: str, path: str, destination: Path, *, timeout: float) -> Path:
+        """Save one file of a job, abandoning a transfer stalled past `timeout` seconds.
+
+        The SDK streams a job file with no read timeout, so a stalled server would hold
+        the stream — and the job's clean-up — open forever. Past the budget the transfer
+        is left to a daemon thread and `NaceAPITimeoutError` is raised; the caller's job
+        clean-up then cancels the job, which ends the stream.
+
+        Raises:
+            NaceAPITimeoutError: The download did not finish within `timeout` seconds.
+
+        """
+        budget = max(timeout, 0.0)
+        box: Queue[Path | BaseException] = Queue()
+
+        def fetch() -> None:
+            try:
+                box.put(
+                    self.call(
+                        lambda client: client.jobs.download(
+                            job_id, path, destination, wait_timeout=budget
+                        )
+                    )
+                )
+            except Exception as error:
+                box.put(error)
+
+        thread = threading.Thread(target=fetch, name="langchain-nace-ndi-download", daemon=True)
+        thread.start()
+        try:
+            item = box.get(timeout=budget)
+        except Empty:
+            raise NaceAPITimeoutError(
+                f"The download of the NDI job {job_id} file did not finish in {timeout:g} s."
+            ) from None
+        if isinstance(item, BaseException):
+            raise item
+        return item

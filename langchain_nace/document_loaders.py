@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -16,11 +17,11 @@ from nace_sdk import DocumentJob
 from pydantic import SecretStr
 
 from langchain_nace._ndi import DEFAULT_JOB_TIMEOUT, NdiClient, Source
-from langchain_nace.errors import NaceError
+from langchain_nace.errors import NaceAPIResponseValidationError, NaceError
 
 TRUNCATED = "content_truncated"
 _PARSE_ONLY = ("source", "chunking", "parse_mode")
-_LOADER_SETS = ("wait_seconds", "extra_body")
+_LOADER_SETS = ("wait_seconds", "extra_body", "timeout")
 
 
 @beta()
@@ -50,7 +51,8 @@ class NaceDocumentLoader(BaseLoader):
             to the server.
         parse_kwargs: More Parse body fields; they replace the defaults, so
             `output={"formats": ["text"]}` returns the plain text instead of the Markdown.
-        timeout: Seconds to wait for the job to finish.
+        timeout: Seconds to bound the whole call: the job's create request, its wait
+            and a truncated-content download.
         api_key: Nace API key. Defaults to `NACE_API_KEY` for the configured endpoint.
         base_url: API root. Defaults to `NACE_BASE_URL`, else `https://console.nace.ai`.
         max_retries: SDK retries for 408, 429 and 5xx.
@@ -89,7 +91,11 @@ class NaceDocumentLoader(BaseLoader):
                 raise ValueError(message)
         self.timeout = timeout
         self._ndi = NdiClient(
-            api_key=api_key, base_url=base_url, max_retries=max_retries, http_client=http_client
+            api_key=api_key,
+            base_url=base_url,
+            max_retries=max_retries,
+            http_client=http_client,
+            retry_timeout=timeout,
         )
 
     def lazy_load(self) -> Iterator[Document]:
@@ -100,21 +106,24 @@ class NaceDocumentLoader(BaseLoader):
             "output": {"formats": ["markdown"]},
             **self.parse_kwargs,
         }
+        deadline = time.monotonic() + self.timeout
         with (
             self._ndi.source(
                 self.source, file_name=self.file_name, workspace_id=self.workspace_id
             ) as src,
             self._ndi.job(
-                lambda client, wait: client.documents.parse(src, **body, wait_seconds=wait),
+                lambda client, wait, call_timeout: client.documents.parse(
+                    src, **body, wait_seconds=wait, timeout=call_timeout
+                ),
                 timeout=self.timeout,
             ) as job,
         ):
-            documents = self._documents(job)
+            documents = self._documents(job, deadline=deadline)
         # The job and the upload are deleted before the first document is handed out, so
         # a consumer that stops early (or is slow) leaves nothing behind.
         yield from documents
 
-    def _documents(self, job: DocumentJob) -> list[Document]:
+    def _documents(self, job: DocumentJob, *, deadline: float) -> list[Document]:
         result = job.result if isinstance(job.result, dict) else {}
         raw_document = result.get("document")
         document = raw_document if isinstance(raw_document, dict) else {}
@@ -140,7 +149,9 @@ class NaceDocumentLoader(BaseLoader):
                     raise NaceError(
                         "The parse result is truncated and has no content_url for the full text."
                     )
-                markdown = self._full_markdown(job.job_id, document["content_url"])
+                markdown = self._full_markdown(
+                    job.job_id, document["content_url"], timeout=deadline - time.monotonic()
+                )
             return [Document(page_content=markdown, metadata=metadata)]
         documents = []
         for chunk in document.get("chunks") or []:
@@ -154,15 +165,17 @@ class NaceDocumentLoader(BaseLoader):
             documents.append(
                 Document(page_content=chunk.get("content") or "", metadata=chunk_metadata)
             )
+        if not documents:
+            raise NaceAPIResponseValidationError(
+                "The parse result has no chunks to load; the response is incomplete."
+            )
         return documents
 
-    def _full_markdown(self, job_id: str, content_url: str) -> str:
+    def _full_markdown(self, job_id: str, content_url: str, *, timeout: float) -> str:
         """The full Markdown of a truncated result, downloaded through the job."""
         with tempfile.TemporaryDirectory() as folder:
-            target = self._ndi.call(
-                lambda client: client.jobs.download(
-                    job_id, content_url, Path(folder) / "content.md"
-                )
+            target = self._ndi.download(
+                job_id, content_url, Path(folder) / "content.md", timeout=timeout
             )
             return target.read_text(encoding="utf-8")
 

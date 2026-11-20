@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -12,10 +14,12 @@ from langchain_core.tools import ToolException
 from pydantic import ValidationError
 
 from langchain_nace import (
+    NaceAPIResponseValidationError,
     NaceAPITimeoutError,
     NaceDocumentLoader,
     NaceError,
     NaceExtractTool,
+    NaceInternalServerError,
     NaceSearchTool,
     NaceUnprocessableEntityError,
 )
@@ -24,6 +28,7 @@ from tests.fakes import (
     NDI_JOB_ID,
     NDI_WS_ID,
     FakeNdi,
+    Reply,
     agent_output,
     error,
     fact_output,
@@ -155,6 +160,40 @@ def test_loader_returns_full_markdown_when_truncated(ndi: FakeNdi) -> None:
     )
     with pytest.raises(NaceError, match="content_url"):
         list(loader.lazy_load())
+    # A failed download surfaces its error like any other SDK call.
+    ndi.content_url = f"https://ndi.test/v1/documents/jobs/{NDI_JOB_ID}/content"
+    ndi.queue("job_file", error(500, "download failed"))
+    broken = NaceDocumentLoader(
+        "https://cdn.test/invoice",
+        file_name="invoice.html",
+        max_retries=0,
+        **options(ndi),
+    )
+    with pytest.raises(NaceInternalServerError, match="download failed"):
+        list(broken.lazy_load())
+
+
+def test_stalled_content_download_times_out_and_still_cancels(ndi: FakeNdi) -> None:
+    # The SDK streams the full content with no read timeout: a stalled server would
+    # hold the stream (and the job's clean-up) open forever. The download must stop
+    # at the job budget, and the job must still be cancelled.
+    ndi.markdown = "# Invoice INV-2026-0042"  # the preview only
+    ndi.disclosures = [{"code": "content_truncated", "message": "over 1 MiB"}]
+    ndi.content_url = f"https://ndi.test/v1/documents/jobs/{NDI_JOB_ID}/content"
+
+    def stalled(body: dict[str, Any]) -> Reply:
+        time.sleep(0.5)
+        return 200, {}, ndi.full_markdown
+
+    ndi.queue("job_file", stalled)
+    loader = NaceDocumentLoader("https://cdn.test/invoice.html", timeout=0.2, **options(ndi))
+    started = time.monotonic()
+    with pytest.raises(NaceAPITimeoutError, match="download"):
+        list(loader.lazy_load())
+    # The stalled transfer is abandoned well before it would have finished.
+    assert time.monotonic() - started < 0.45
+    last = ndi.requests[-1]
+    assert (last.method, last.url.path) == ("DELETE", f"/v1/documents/jobs/{NDI_JOB_ID}")
 
 
 def test_failed_job_raises_and_still_cleans_up(ndi: FakeNdi, tmp_path: Path) -> None:
@@ -195,7 +234,170 @@ def test_wait_timeout_raises_and_cancels_the_job(ndi: FakeNdi) -> None:
     assert (last.method, last.url.path) == ("DELETE", f"/v1/documents/jobs/{NDI_JOB_ID}")
 
 
-def test_api_error_is_converted_and_redacted(ndi: FakeNdi) -> None:
+def test_create_past_the_timeout_raises_and_cancels(ndi: FakeNdi) -> None:
+    # The create request answered a finished job, but only after the whole job budget
+    # had passed: that is a timeout, not a late success.
+    def slow_create(body: dict[str, Any]) -> Reply:
+        time.sleep(0.16)
+        return 200, {}, ndi.parse_job()
+
+    ndi.queue("parse", slow_create)
+    loader = NaceDocumentLoader("https://cdn.test/invoice.html", timeout=0.05, **options(ndi))
+    with pytest.raises(NaceAPITimeoutError, match="did not finish"):
+        list(loader.lazy_load())
+    # The late job is cancelled, not left running.
+    last = ndi.requests[-1]
+    assert (last.method, last.url.path) == ("DELETE", f"/v1/documents/jobs/{NDI_JOB_ID}")
+
+
+def test_retries_stop_at_the_job_budget(ndi: FakeNdi) -> None:
+    # A retried create waits out its backoff outside the wait loop; the retry budget
+    # must stop it before the whole job budget is spent, surfacing the server's error.
+    ndi.queue(
+        "parse",
+        (
+            503,
+            {},
+            {
+                "error": {
+                    "type": "service_unavailable",
+                    "code": "job_pending",
+                    "message": "The service is busy; the job may still run.",
+                },
+                "request_id": "req_busy",
+            },
+        ),
+    )
+    loader = NaceDocumentLoader("https://cdn.test/invoice.html", timeout=0.05, **options(ndi))
+    with pytest.raises(NaceInternalServerError, match="busy"):
+        list(loader.lazy_load())
+    creates = [r for r in ndi.requests if r.url.path == "/v1/documents/parse"]
+    assert len(creates) == 1
+
+
+def test_create_hold_stays_within_the_job_budget(ndi: FakeNdi) -> None:
+    # The hold the create asks the server for is part of the budget: with less than
+    # the one-second hold minimum left, no hold is requested at all.
+    loader = NaceDocumentLoader("https://cdn.test/invoice.html", timeout=0.5, **options(ndi))
+    list(loader.lazy_load())
+    [create] = [r for r in ndi.requests if r.url.path == "/v1/documents/parse"]
+    assert "wait_seconds" not in create.url.params
+    # A comfortable budget still asks for a hold, capped by the SDK's maximum.
+    ndi.requests.clear()
+    loader = NaceDocumentLoader("https://cdn.test/invoice.html", timeout=120, **options(ndi))
+    list(loader.lazy_load())
+    [create] = [r for r in ndi.requests if r.url.path == "/v1/documents/parse"]
+    assert create.url.params.get("wait_seconds") == "60"
+
+
+def test_no_job_read_after_the_deadline(ndi: FakeNdi) -> None:
+    # Every poll must start before the budget runs out; the SDK's own wait loop
+    # issues one more read after the deadline before raising.
+    ndi.stuck_queued = True
+    ndi.queue("parse", (202, {}, {"job_id": NDI_JOB_ID, "kind": "parse", "status": "queued"}))
+    reads: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if (request.method, request.url.path) == ("GET", f"/v1/documents/jobs/{NDI_JOB_ID}"):
+            reads.append(time.monotonic())
+        return ndi(request)
+
+    loader = NaceDocumentLoader(
+        "https://cdn.test/invoice.html",
+        timeout=0.2,
+        **{
+            **options(ndi),
+            "http_client": httpx.Client(transport=httpx.MockTransport(handler)),
+        },
+    )
+    started = time.monotonic()
+    with pytest.raises(NaceAPITimeoutError, match="did not finish"):
+        list(loader.lazy_load())
+    deadline = started + 0.2
+    assert reads  # the job was polled, and only before the deadline
+    assert all(when < deadline for when in reads)
+    # The stuck job is still cancelled.
+    last = ndi.requests[-1]
+    assert (last.method, last.url.path) == ("DELETE", f"/v1/documents/jobs/{NDI_JOB_ID}")
+
+
+def test_job_pending_error_keeps_the_idempotency_key(ndi: FakeNdi) -> None:
+    # A 503 job_pending may leave the job running server-side; the SDK documents that
+    # resending the same body with the same Idempotency-Key resumes it. The raised
+    # error must keep that key, or a retry mints a new one and starts a second job.
+    ndi.queue(
+        "parse",
+        (
+            503,
+            {},
+            {
+                "error": {
+                    "type": "service_unavailable",
+                    "code": "job_pending",
+                    "message": "The document job is pending; it may still run.",
+                },
+                "request_id": "req_pending",
+            },
+        ),
+    )
+    loader = NaceDocumentLoader(
+        "https://cdn.test/invoice.html", max_retries=0, **options(ndi)
+    )
+    with pytest.raises(NaceInternalServerError, match="pending") as excinfo:
+        list(loader.lazy_load())
+    key = excinfo.value.idempotency_key
+    [create] = [r for r in ndi.requests if r.url.path == "/v1/documents/parse"]
+    assert key is not None
+    assert key == create.headers["idempotency-key"]
+    # No job came back, so there is nothing to delete: the key is the only handle.
+    assert not any(r.method == "DELETE" for r in ndi.requests)
+
+
+def test_job_pending_keeps_the_uploaded_file(ndi: FakeNdi, tmp_path: Path) -> None:
+    # The pending job and its documented replay need the uploaded file: it must not
+    # be deleted, and the error must say where it is and how to delete it.
+    path = tmp_path / "invoice.html"
+    path.write_text("<html><body>Invoice INV-2026-0042</body></html>")
+    ndi.queue(
+        "parse",
+        (
+            503,
+            {},
+            {
+                "error": {
+                    "type": "service_unavailable",
+                    "code": "job_pending",
+                    "message": "The document job is pending; it may still run.",
+                },
+                "request_id": "req_pending",
+            },
+        ),
+    )
+    loader = NaceDocumentLoader(path, max_retries=0, **options(ndi))
+    with pytest.raises(NaceInternalServerError, match="pending") as excinfo:
+        list(loader.lazy_load())
+    assert excinfo.value.idempotency_key is not None
+    text = str(excinfo.value)
+    assert "kept" in text
+    assert NDI_WS_ID in text
+    assert NDI_FILE_ID in text
+    assert "delete_file" in text
+    assert not any(r.method == "DELETE" for r in ndi.requests)
+    # Any other create failure leaves no pending job: the file is still cleaned up.
+    ndi.queue("parse", error(422, "chunking.strategy: unknown strategy"))
+    loader = NaceDocumentLoader(path, max_retries=0, **options(ndi))
+    with pytest.raises(NaceUnprocessableEntityError):
+        list(loader.lazy_load())
+    assert any(
+        (r.method, r.url.path)
+        == ("DELETE", f"/v1/documents/workspaces/{NDI_WS_ID}/files/{NDI_FILE_ID}")
+        for r in ndi.requests
+    )
+
+
+def test_api_error_is_converted_and_redacted(
+    ndi: FakeNdi, caplog: pytest.LogCaptureFixture
+) -> None:
     # An opaque key the generic redaction patterns would not match: only the secrets
     # passed to `convert_error` by `NdiClient.call` can redact it.
     opaque = "opaque-FAKE-key-for-test"
@@ -209,6 +411,22 @@ def test_api_error_is_converted_and_redacted(ndi: FakeNdi) -> None:
     assert "unknown strategy" in str(excinfo.value)
     assert opaque not in str(excinfo.value)
     assert "[REDACTED]" in str(excinfo.value)
+    # The message is redacted, and so are the other places the echoed key survives:
+    # the upstream body kept for inspection, and the raw SDK error the wrapper would
+    # still reference as its `__context__`.
+    assert opaque not in json.dumps(excinfo.value.body)
+    assert "[REDACTED]" in json.dumps(excinfo.value.body)
+    assert excinfo.value.__context__ is None
+    # The SDK's DEBUG wire log prints the response body verbatim (its own filter masks
+    # only credential headers and secret body fields); our keys must not reach it.
+    ndi.queue("parse", error(422, f"chunking.strategy: unknown strategy (key {opaque})"))
+    with (
+        caplog.at_level(logging.DEBUG, logger="nace_sdk"),
+        pytest.raises(NaceUnprocessableEntityError),
+    ):
+        list(loader.lazy_load())
+    assert any(record.levelno == logging.DEBUG for record in caplog.records)
+    assert opaque not in caplog.text
 
 
 def test_configuration_rules(ndi: FakeNdi, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -248,6 +466,14 @@ def test_configuration_rules(ndi: FakeNdi, monkeypatch: pytest.MonkeyPatch) -> N
         NaceDocumentLoader(
             "https://cdn.test/invoice.html",
             parse_kwargs={"extra_body": {}},
+            **options(ndi),
+        )
+    # `timeout` would collide with the loader's own keyword on the SDK call: a clear
+    # rejection in the constructor, not a TypeError from lazy_load.
+    with pytest.raises(ValueError, match="timeout"):
+        NaceDocumentLoader(
+            "https://cdn.test/invoice.html",
+            parse_kwargs={"timeout": 30},
             **options(ndi),
         )
     with pytest.raises(ValidationError, match="workspace_id") as as_error:
@@ -342,6 +568,126 @@ def test_search_tool_answers_fact_and_agent_shapes(ndi: FakeNdi) -> None:
     assert body["mode"] == "fact"
     assert body["top_k"] == 5
     assert len([r for r in ndi.requests if r.method == "DELETE"]) == 2
+
+
+def test_missing_results_raise_response_errors(ndi: FakeNdi) -> None:
+    # A succeeded job whose result is missing must not become empty output: the page
+    # mode returned no documents, Extract null data and Search a null answer.
+    loader = NaceDocumentLoader(
+        "https://cdn.test/invoice.html", chunking="page", **options(ndi)
+    )
+    with pytest.raises(NaceAPIResponseValidationError, match="chunks"):
+        list(loader.lazy_load())
+    ndi.queue(
+        "extract",
+        (200, {}, {"job_id": NDI_JOB_ID, "kind": "extract", "status": "succeeded",
+                   "result": None}),
+    )
+    extract = NaceExtractTool(extraction_schema=SCHEMA, **options(ndi))
+    with pytest.raises(NaceAPIResponseValidationError, match="data"):
+        extract.invoke(
+            {**TOOL_CALL, "args": {"source": "https://cdn.test/invoice.html"}, "id": "call_1"}
+        )
+    ndi.queue(
+        "search",
+        (200, {}, {"job_id": NDI_JOB_ID, "kind": "automatic_search", "status": "succeeded",
+                   "result": None}),
+    )
+    search = NaceSearchTool(workspace_id=NDI_WS_ID, **options(ndi))
+    with pytest.raises(NaceAPIResponseValidationError, match="answer"):
+        search.invoke(
+            {
+                "name": "nace_search",
+                "args": {"query": "What is the total due?"},
+                "id": "call_2",
+                "type": "tool_call",
+            }
+        )
+    # The jobs behind the unusable results are still deleted.
+    assert len([r for r in ndi.requests if r.method == "DELETE"]) == 3
+
+
+def test_validation_errors_do_not_expose_the_api_key() -> None:
+    # A missing required field makes pydantic echo the whole input dict in
+    # `.errors()` and `.json()`; the key must be masked by then.
+    with pytest.raises(ValidationError, match="workspace_id") as search_error:
+        NaceSearchTool(api_key=KEY, base_url="https://ndi.test")
+    assert KEY not in search_error.value.json()
+    assert all(KEY not in str(issue) for issue in search_error.value.errors())
+    with pytest.raises(ValidationError, match="extraction_schema") as extract_error:
+        NaceExtractTool(api_key=KEY, base_url="https://ndi.test")
+    assert KEY not in extract_error.value.json()
+    assert all(KEY not in str(issue) for issue in extract_error.value.errors())
+
+
+def test_empty_results_raise_response_errors(ndi: FakeNdi) -> None:
+    # A succeeded job whose answer is empty is as unusable as a missing one.
+    ndi.queue(
+        "extract",
+        (
+            200,
+            {},
+            {
+                "job_id": NDI_JOB_ID,
+                "kind": "extract",
+                "status": "succeeded",
+                "result": {"data": None, "fields": []},
+            },
+        ),
+    )
+    extract = NaceExtractTool(extraction_schema=SCHEMA, **options(ndi))
+    with pytest.raises(NaceAPIResponseValidationError, match="data"):
+        extract.invoke(
+            {**TOOL_CALL, "args": {"source": "https://cdn.test/invoice.html"}, "id": "call_1"}
+        )
+    search = NaceSearchTool(workspace_id=NDI_WS_ID, **options(ndi))
+    outputs = [
+        # An empty fact answer.
+        {"answer": "", "confidence": "high", "evidences": []},
+        # An agent answer object without an answer text.
+        {"route": "agent", "answer": {"answer": "", "confidence": "low", "evidences": []}},
+    ]
+    for output in outputs:
+        ndi.queue("search", (200, {}, ndi.search_job(output)))
+        with pytest.raises(NaceAPIResponseValidationError, match="answer"):
+            search.invoke(
+                {
+                    "name": "nace_search",
+                    "args": {"query": "What is the total due?"},
+                    "id": "call_2",
+                    "type": "tool_call",
+                }
+            )
+
+
+def test_content_response_format_returns_content_only(ndi: FakeNdi) -> None:
+    # With response_format="content" the model must see the JSON answer only; the
+    # raw job result is the artifact and stays out of the ToolMessage content.
+    extract = NaceExtractTool(
+        extraction_schema=SCHEMA, response_format="content", **options(ndi)
+    )
+    message = extract.invoke(
+        {**TOOL_CALL, "args": {"source": "https://cdn.test/invoice.html"}, "id": "call_1"}
+    )
+    data = json.loads(message.content)
+    assert set(data) == {"data", "fields"}
+    assert data["data"]["invoice_number"] == "INV-2026-0042"
+    assert message.artifact is None
+    search = NaceSearchTool(
+        workspace_id=NDI_WS_ID, response_format="content", **options(ndi)
+    )
+    answer = json.loads(
+        search.invoke(
+            {
+                "name": "nace_search",
+                "args": {"query": "What is the total due?"},
+                "id": "call_2",
+                "type": "tool_call",
+            }
+        ).content
+    )
+    assert set(answer) == {"answer", "confidence", "evidences"}
+    assert answer["answer"] == "The total due is USD 400.00."
 
 
 def test_cleanup_failure_warns_but_keeps_the_result(

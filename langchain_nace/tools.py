@@ -9,9 +9,17 @@ import httpx
 from langchain_core._api import beta
 from langchain_core.callbacks import CallbackManagerForToolRun
 from langchain_core.tools import BaseTool, ToolException
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SecretStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    model_validator,
+)
 
 from langchain_nace._ndi import DEFAULT_JOB_TIMEOUT, NdiClient
+from langchain_nace.errors import NaceAPIResponseValidationError
 
 EXTRACT_DESCRIPTION = (
     "Extract structured fields from one document. Input: the public https URL of the "
@@ -56,6 +64,18 @@ class _NdiTool(BaseTool):
 
     _ndi: NdiClient = PrivateAttr()
 
+    @model_validator(mode="before")
+    @classmethod
+    def _mask_plain_api_key(cls, values: Any) -> Any:
+        """Wrap a plain-string `api_key` in `SecretStr` before field validation.
+
+        A missing required field makes pydantic echo the whole input dict in
+        `.errors()` and `.json()`; the key must be masked by then, not after.
+        """
+        if isinstance(values, dict) and isinstance(values.get("api_key"), str):
+            values = {**values, "api_key": SecretStr(values["api_key"])}
+        return values
+
     def model_post_init(self, context: Any, /) -> None:
         super().model_post_init(context)
         self._ndi = NdiClient(
@@ -63,6 +83,7 @@ class _NdiTool(BaseTool):
             base_url=self.base_url,
             max_retries=self.max_retries,
             http_client=self.http_client,
+            retry_timeout=self.timeout,
         )
 
 
@@ -99,7 +120,9 @@ class NaceExtractTool(_NdiTool):
         workspace_id: Upload target for local files; without it they go to the server.
         api_key: Nace API key. Defaults to `NACE_API_KEY` for the configured endpoint.
         base_url: API root. Defaults to `NACE_BASE_URL`, else `https://console.nace.ai`.
-        timeout: Seconds to wait for the job to finish.
+        timeout: Seconds to bound the whole call: the job's create request and its wait.
+        response_format: `"content"` returns the JSON answer only; the default
+            `"content_and_artifact"` also returns the raw job result as the artifact.
         max_retries: SDK retries for 408, 429 and 5xx.
         http_client: Optional `httpx.Client` (custom transport, proxy, tests).
 
@@ -124,25 +147,28 @@ class NaceExtractTool(_NdiTool):
 
     def _run(
         self, source: str, run_manager: CallbackManagerForToolRun | None = None
-    ) -> tuple[str, dict[str, Any]]:
-        """Extract the fields; returns the JSON answer and the raw result as artifact."""
+    ) -> str | tuple[str, dict[str, Any]]:
+        """Extract the fields; the JSON answer, plus the raw result as artifact."""
         if "://" not in source and not self.allow_local_files:
             raise ToolException("source must be a public https:// URL.")
         try:
             with (
                 self._ndi.source(source, workspace_id=self.workspace_id) as src,
                 self._ndi.job(
-                    lambda client, wait: client.documents.extract(
+                    lambda client, wait, call_timeout: client.documents.extract(
                         src,
                         schema=self.extraction_schema,
                         instructions=self.instructions,
                         parse_mode=self.parse_mode,
                         wait_seconds=wait,
+                        timeout=call_timeout,
                     ),
                     timeout=self.timeout,
                 ) as job,
             ):
                 result = job.result if isinstance(job.result, dict) else {}
+                if result.get("data") is None:
+                    raise NaceAPIResponseValidationError("The extract result has no data.")
                 fields = []
                 for field in result.get("fields") or []:
                     if not isinstance(field, dict):
@@ -163,6 +189,10 @@ class NaceExtractTool(_NdiTool):
                 answer = json.dumps(
                     {"data": result.get("data"), "fields": fields}, ensure_ascii=False
                 )
+                # Content-only mode must not serialize the raw result into the content
+                # the model reads; it is the artifact and stays out of the message.
+                if self.response_format == "content":
+                    return answer
                 return answer, result
         except ValueError as error:
             raise ToolException(str(error)) from None
@@ -190,7 +220,9 @@ class NaceSearchTool(_NdiTool):
         path_prefix: Search only the files under this path.
         api_key: Nace API key. Defaults to `NACE_API_KEY` for the configured endpoint.
         base_url: API root. Defaults to `NACE_BASE_URL`, else `https://console.nace.ai`.
-        timeout: Seconds to wait for the job to finish.
+        timeout: Seconds to bound the whole call: the job's create request and its wait.
+        response_format: `"content"` returns the JSON answer only; the default
+            `"content_and_artifact"` also returns the raw job result as the artifact.
         max_retries: SDK retries for 408, 429 and 5xx.
         http_client: Optional `httpx.Client` (custom transport, proxy, tests).
 
@@ -206,16 +238,17 @@ class NaceSearchTool(_NdiTool):
 
     def _run(
         self, query: str, run_manager: CallbackManagerForToolRun | None = None
-    ) -> tuple[str, dict[str, Any]]:
-        """Answer the question; returns the JSON answer and the raw result as artifact."""
+    ) -> str | tuple[str, dict[str, Any]]:
+        """Answer the question; the JSON answer, plus the raw result as artifact."""
         with self._ndi.job(
-            lambda client, wait: client.search.automatic(
+            lambda client, wait, call_timeout: client.search.automatic(
                 self.workspace_id,
                 query=query,
                 mode=self.mode,
                 top_k=self.top_k,
                 path_prefix=self.path_prefix,
                 wait_seconds=wait,
+                timeout=call_timeout,
             ),
             timeout=self.timeout,
         ) as job:
@@ -224,6 +257,10 @@ class NaceSearchTool(_NdiTool):
             output = raw_output if isinstance(raw_output, dict) else {}
             raw_answer = output.get("answer")
             answer = raw_answer if isinstance(raw_answer, dict) else output
+            text = answer.get("answer")
+            # An empty or missing answer (fact or agent shape) is an unusable response.
+            if not isinstance(text, str) or not text:
+                raise NaceAPIResponseValidationError("The search result has no answer.")
             evidences = [
                 {
                     "source_path": evidence.get("source_path"),
@@ -235,12 +272,16 @@ class NaceSearchTool(_NdiTool):
             ]
             content = json.dumps(
                 {
-                    "answer": answer.get("answer"),
+                    "answer": text,
                     "confidence": answer.get("confidence"),
                     "evidences": evidences,
                 },
                 ensure_ascii=False,
             )
+            # Content-only mode must not serialize the raw result into the content the
+            # model reads; it is the artifact and stays out of the message.
+            if self.response_format == "content":
+                return content
             return content, result
 
 
