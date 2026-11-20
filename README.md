@@ -11,10 +11,10 @@
   <a href="https://github.com/nace-ai/langchain-nace/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
 </p>
 
-LangChain integration for [Drex](https://console.nace.ai/docs), Nace's decision models. Drex reads text, JSON, LangChain messages and (on Drex Max) images, and returns typed answers with calibrated probabilities instead of generated text. Use it to route requests, pick models, or check tool calls before they run.
+LangChain integration for [Drex](https://console.nace.ai/docs), Nace's decision models, and for Nace Document Intelligence (NDI): a document loader, an extraction tool and a workspace search tool. Drex reads text, JSON, LangChain messages and (on Drex Max) images, and returns typed answers with calibrated probabilities instead of generated text. Use it to route requests, pick models, or check tool calls before they run.
 
 ```bash
-pip install langchain-nace                  # classifier, router, LangGraph edge
+pip install langchain-nace                  # classifier, router, loader, tools, LangGraph edge
 pip install "langchain-nace[experimental]"  # + agent middleware
 export NACE_API_KEY=nace_sk_...
 ```
@@ -108,6 +108,43 @@ chain = router.branch(
 ```
 
 LangGraph: `nace_conditional_edge(classifier, question, state=..., min_confidence=0.7)` is a path function for `add_conditional_edges`. Below the threshold it returns `"human_review"`, so that node can `interrupt()` for a person. See [`examples/langgraph_router.py`](https://github.com/nace-ai/langchain-nace/blob/main/examples/langgraph_router.py).
+
+## Documents (NDI)
+
+Nace Document Intelligence (NDI) is the document side of the same API: it parses documents to Markdown, extracts structured fields and answers questions over the files in a workspace. It is cloud only, and uses the same `NACE_API_KEY` as Drex.
+
+```python
+from langchain_nace import NaceDocumentLoader, NaceExtractTool, NaceSearchTool
+
+loader = NaceDocumentLoader("invoice.pdf", chunking="page")  # or a public https:// URL
+pages = loader.load()
+
+extract = NaceExtractTool(
+    extraction_schema={
+        "type": "object",
+        "properties": {"invoice_number": {"type": "string"}, "total": {"type": "number"}},
+    },
+    instructions="Extract the billing fields.",
+)
+
+search = NaceSearchTool(workspace_id="...")  # an ingested workspace
+answer = search.invoke({"name": "nace_search", "args": {"query": "What is the total due?"},
+                        "id": "call_1", "type": "tool_call"})
+```
+
+The loader yields one `Document` for the whole Markdown (`chunking="none"`), or one per page or section (`chunking="page"`/`"section"`), with `source`, `job_id`, `page_count` (and `chunk_id`, `page`) in the metadata. The extract tool returns, for each field, its status (`found`, `not_found` or `ambiguous`), confidence and the quoted source text; the search tool returns the answer, its confidence and the evidence it cites. Both tools are `content_and_artifact` tools: the artifact is the raw job result. With `response_format="content"` they return the JSON answer only, and the raw result stays out of the model-facing content.
+
+Rules:
+
+- `timeout` (300 s by default) bounds the job (it starts after any local-file upload) — the create request, the wait, and a truncated-content download; past it the job is cancelled and `NaceAPITimeoutError` is raised. The bound is best-effort: a request already in flight, an SDK retry or the clean-up can run slightly past the deadline.
+- The loader and the extract tool delete the uploaded file and the job after the read; the search tool deletes its job. A failed clean-up is logged, not raised. The one exception is the kept file after a `503 job_pending` (next rule).
+- After a `503` with code `job_pending` the job may still run server-side: the raised error keeps the request's idempotency key (`error.idempotency_key`), and resending the same body with that key (through `nace_sdk`) resumes that job instead of starting another. The uploaded file behind a local source is kept in that case — the pending job and the replay need it — and the error message names the workspace and file and shows the `client.documents.delete_file(...)` call that deletes it.
+- Local files are uploaded under a unique path `langchain-nace/<id>/<name>`, and that upload is deleted after the read.
+- `allow_local_files` is off by default because the model controls the tool input: only `https://` URLs are accepted (NDI fetches the URL from its own servers), and local paths are refused unless you opt in.
+- A supplied `http_client` is also used for the upload and download hosts, so do not put credentials in its default headers.
+- The extraction schema is a JSON Schema subset (no `$ref`, `anyOf` or `format`); pass it as a `dict`.
+- There is no retriever: NDI search returns one generated answer and the quotes it cites, not ranked passages or scores. A retriever built on evidences would give a second LLM a partial, unranked context and would hide the answer NDI already made, so the honest slot is an agent tool that returns the answer with its citations.
+- NDI is not available through OpenRouter; the credential rules of the [Backends](#backends) section apply.
 
 ## Agent middleware (experimental)
 
@@ -276,9 +313,14 @@ Serialized classifiers pin the endpoint and refer to `OPENROUTER_API_KEY` for
 OpenRouter, or `NACE_API_KEY` for other endpoints; the key itself is not serialized.
 
 Same-origin redirects retain credentials when the supplied HTTP client follows
-redirects. A redirect to a different scheme, host or port strips authentication,
-cookies and internal deployment headers. Internal deployment credentials are also
-excluded from every endpoint except the production HTTPS hosts
+redirects. A redirect to a different scheme, host or port is refused on
+`nace-sdk` 0.9.0 (required from langchain-nace 0.2.0): the call raises
+`NaceError` and nothing is sent to the redirect target. Earlier SDKs, which
+0.1.5 and older accept, followed such a redirect with authentication, cookies
+and internal deployment headers stripped. Point `NACE_BASE_URL` at the final
+origin, or keep redirects same-origin; pin `langchain-nace==0.1.5` together with an older `nace-sdk` (`nace-sdk==0.3.0` is known to follow these redirects) while you
+migrate if you depend on the old behavior. Internal deployment credentials are
+also excluded from every endpoint except the production HTTPS hosts
 `console.nace.ai` and its legacy alias `drex.nace.ai` on port 443.
 
 Version 0.1.4 restores environment-based custom endpoint configuration, which

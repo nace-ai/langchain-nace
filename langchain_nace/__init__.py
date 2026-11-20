@@ -2,6 +2,7 @@
 
 from langchain_nace._version import __version__
 from langchain_nace.classifier import NaceClassifier
+from langchain_nace.document_loaders import NaceDocumentLoader
 from langchain_nace.errors import (
     NaceAPIConnectionError,
     NaceAPIError,
@@ -24,6 +25,7 @@ from langchain_nace.errors import (
 )
 from langchain_nace.graph import nace_conditional_edge
 from langchain_nace.router import NaceLowConfidenceError, NaceRouter, RouteDecision
+from langchain_nace.tools import NaceExtractTool, NaceSearchTool
 from langchain_nace.types import (
     Answer,
     Choice,
@@ -55,7 +57,9 @@ __all__ = [
     "NaceBadRequestError",
     "NaceBatchStoppedError",
     "NaceClassifier",
+    "NaceDocumentLoader",
     "NaceError",
+    "NaceExtractTool",
     "NaceImageError",
     "NaceImageModelError",
     "NaceInsufficientCreditError",
@@ -67,6 +71,7 @@ __all__ = [
     "NacePermissionDeniedError",
     "NaceRateLimitError",
     "NaceRouter",
+    "NaceSearchTool",
     "NaceUnprocessableEntityError",
     "Noul",
     "NoulAnswer",

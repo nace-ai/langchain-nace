@@ -55,17 +55,25 @@ class NaceMediaError(NaceError, ValueError):
 
 
 class NaceAPIError(NaceError):
-    """Drex answered with an unsuccessful HTTP status."""
+    """Drex answered with an unsuccessful HTTP status.
+
+    After a `503` with code `job_pending` the job may still run server-side; the SDK
+    documents that resending the same body with the failed request's `Idempotency-Key`
+    resumes that job instead of starting another. The key is kept on
+    `idempotency_key`, and document creates always carry one.
+    """
 
     def __init__(self, error: nace_sdk.NaceAPIError, message: str | None = None) -> None:
-        """Wrap an SDK error, keeping its status, request id and issues."""
+        """Wrap an SDK error, keeping its status, request id, code and issues."""
         super().__init__(message or str(error))
         self.status: int = error.status
         self.request_id: str | None = error.request_id
         self.type: str | None = error.type
+        self.code: str | None = error.code
         self.issues: list[dict[str, str]] = error.issues
         self.headers = error.headers
         self.body: Any = error.body
+        self.idempotency_key: str | None = error.idempotency_key
 
     @property
     def status_code(self) -> int:
