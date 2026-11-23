@@ -16,6 +16,10 @@ from langchain_nace.experimental.middleware.model_router import (
     NaceModelRoute,
     NaceModelRouterMiddleware,
 )
+from langchain_nace.experimental.middleware.model_selector import (
+    ModelCandidate,
+    NaceModelSelectorMiddleware,
+)
 
 # The names `langchain-typesafe` uses, so switching is an import change.
 AutoModeMiddleware = NaceAutoModeMiddleware
@@ -30,10 +34,12 @@ __all__ = [
     "GatePolicy",
     "GateQuestions",
     "GateVerdict",
+    "ModelCandidate",
     "ModelChoice",
     "ModelRouterMiddleware",
     "NaceAutoModeMiddleware",
     "NaceModelRoute",
     "NaceModelRouterMiddleware",
+    "NaceModelSelectorMiddleware",
     "ThresholdPolicy",
 ]

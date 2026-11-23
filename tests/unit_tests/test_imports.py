@@ -2,6 +2,7 @@ import langchain_nace
 from langchain_nace.experimental import middleware
 
 EXPECTED = {
+    "CandidateProfile",
     "Choice",
     "ChoiceAnswer",
     "ClassifierRequest",
@@ -14,6 +15,8 @@ EXPECTED = {
     "Noul",
     "NoulAnswer",
     "NoulCriteria",
+    "ModelSelection",
+    "NaceModelSelector",
     "Score",
     "ScoreAnswer",
     "RawAnswer",
@@ -25,9 +28,13 @@ EXPECTED = {
 
 def test_public_names() -> None:
     assert set(langchain_nace.__all__) >= EXPECTED
-    assert {"NaceAutoModeMiddleware", "NaceModelRouterMiddleware", "ModelChoice"} <= set(
-        middleware.__all__
-    )
+    assert {
+        "NaceAutoModeMiddleware",
+        "NaceModelRouterMiddleware",
+        "NaceModelSelectorMiddleware",
+        "ModelCandidate",
+        "ModelChoice",
+    } <= set(middleware.__all__)
 
 
 def test_typesafe_names_match() -> None:

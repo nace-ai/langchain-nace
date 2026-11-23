@@ -3,6 +3,56 @@
 Notable changes per release. Versions before 0.2.0 have no changelog entry; the
 [commit history](https://github.com/nace-ai/langchain-nace/commits/main) covers them.
 
+## 0.3.0 - unreleased
+
+### Added
+
+- `NaceModelSelector` asks Drex Router (`POST /v1/route`) which candidate should
+  answer a conversation. It does not call a chat model.
+- `NaceModelSelectorMiddleware` and `ModelCandidate` select the model on the first
+  model call of a run and store a `ModelSelection` in `nace_model_selection`.
+  `before_agent` clears that key and makes no network call. A resumed run reuses
+  the checkpointed selection while that model is still eligible and selects
+  again otherwise.
+- The route call is one attempt. Async code enforces `timeout` with
+  `asyncio.timeout`. Sync code passes `timeout` to the SDK for each HTTP
+  operation. Caller cancellation is raised again and does not call the handler.
+
+### Changed
+
+- Requires `nace-sdk>=0.11.1,<1.0.0` (from `>=0.9.0,<1.0.0`).
+
+### Fixed
+
+- A stored model is reused only when it is still eligible for the current request.
+  A tool result that adds an image, a tool, or a longer prompt selects again.
+- Image blocks include `input_image`, a block with an `image` key, and `media`
+  or `file` blocks whose mime type starts with `image/`. A `response_format`
+  counts as tools, including for the fallback.
+- Profiles use the server limits: provider and tags are non-blank and at most 128
+  characters, at most 64 tags, and ids, providers, and tags together at most
+  100000 characters. Blank means no character outside JavaScript whitespace,
+  including U+FEFF. `context` is at most 2^53 − 1.
+- `httpx.HTTPStatusError` from a caller-supplied client uses the status table.
+  Any other `httpx.HTTPError`, and any other exception from the exchange, is
+  `connection_error`. An error or a response that arrives after the deadline is
+  `timeout` on both the sync and async paths.
+- A request id is stored only when it matches `req_` plus 8 to 64 letters or
+  digits and does not contain a configured secret.
+- The latest human message is kept, and the rest of the character budget is
+  filled with the newest other turns first. The turns stay in chronological
+  order. A human turn that is only a media placeholder is not text. If the
+  latest human message has no real text, including an image-only turn, the
+  reason is `no_input` in both context modes and nothing is sent.
+- A stored selection is reused only when `model` is `None` or a configured
+  candidate id that is still eligible, and every field of the record is well
+  formed. Any other shape is ignored.
+- `no_eligible_candidate` uses the agent's own model. The fallback is filtered
+  by the same eligibility rule, so it is not used when no candidate is eligible.
+- A caller cancellation propagates, including when it is still pending after
+  another error from the route exchange. The handler is not called. An error
+  from the handler propagates and is not retried on the fallback.
+
 ## 0.2.0 - 2026-11-20
 
 ### Added — Nace Document Intelligence (NDI)

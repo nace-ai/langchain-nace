@@ -26,6 +26,8 @@ flowchart TB
             NR["NaceRouter<br/>.branch()"]
             NE["nace_conditional_edge()<br/>(LangGraph path)"]
             MR["NaceModelRouterMiddleware<br/>before_agent + wrap_model_call"]
+            MS["NaceModelSelectorMiddleware<br/>wrap_model_call"]
+            SEL["NaceModelSelector<br/>select / aselect"]
             AM["NaceAutoModeMiddleware<br/>wrap_tool_call"]
         end
         subgraph Core["Core (pure, offline-tested)"]
@@ -46,16 +48,20 @@ flowchart TB
 
     subgraph Backends
         NACE["console.nace.ai/v1/systemone"]
+        ROUTE["console.nace.ai/v1/route"]
         ORT["openrouter.ai/api/v1/systemone"]
         GW["Vercel AI Gateway / TypeSafe-compatible"]
     end
 
     LS[("LangSmith<br/>llm runs: questions, probabilities,<br/>usage, request id, thresholds")]
 
-    APP --> NC & NR & NE & MR & AM
+    APP --> NC & NR & NE & MR & MS & AM
     NR --> NC
     NE --> NC
     MR --> NC
+    MS --> SEL
+    SEL --> RK["nace-sdk route()<br/>one attempt; User-Agent + X-Nace-Client"]
+    RK --> ROUTE
     AM --> GATE --> NC
     NC --> ST --> IM
     NC --> TY
@@ -190,6 +196,33 @@ classDiagram
         escalated: bool
         reason: confident|low_confidence|error
     }
+    class CandidateProfile {
+        <<TypedDict>>
+        id?: str
+        provider: str
+        price_in: float
+        price_out: float
+        context: int
+        tags: list~str~
+    }
+    class ModelCandidate {
+        model: chat model or name
+        profile: CandidateProfile|None
+        images: bool = True
+        tools: bool = True
+    }
+    class ModelSelection {
+        <<TypedDict in agent state nace_model_selection>>
+        model: str|None
+        selected: str|None
+        probabilities: dict
+        fallback: bool
+        reason: str
+        priority: str
+        candidates: list~str~
+        request_id: str|None
+        latency_ms: int|None
+    }
     class GateQuestions {
         risk: Score
         destructive: Noul
@@ -230,6 +263,8 @@ classDiagram
     Answer <|-- RawAnswer
     RouteDecision --> ChoiceAnswer
     NaceModelRoute ..> ChoiceAnswer : flattened copy
+    ModelCandidate --> CandidateProfile
+    ModelSelection ..> ModelCandidate : candidate id
     GateQuestions --> Score
     GateQuestions --> Noul
     GateVerdict --> ClassifierResponse
@@ -250,3 +285,9 @@ classDiagram
 | `images` | base64 / data URL / `{type: workspace_file, ...}`; explicit images first, then images from messages |
 | OpenRouter | no `images`; `state` = `[{type: text}, {type: image_url, image_url: {url: data:...}}...]` |
 | headers | `User-Agent`, `X-Nace-Client` = `langchain-nace/<version>`; OpenRouter also `HTTP-Referer`, `X-OpenRouter-Title` |
+| `POST /v1/route` `messages` | text turns `{role, content}`; roles `system`, `user`, `assistant`; tool calls dropped; tool results omitted; non-text blocks become placeholders. The latest human message is kept, then the newest other turns fill the rest of the 24,000-character budget, and the output stays chronological. An image-only latest human message sends nothing (`no_input`) in both context modes. `image`, `image_url`, and `input_image` blocks, a block with an `image` key, and `media` or `file` blocks with an `image/` mime type, make the request an image request |
+| `candidates` | bare known id, or `{id, provider, price_in, price_out, context, tags}`. `id` may be omitted on input. Provider and each tag are at most 128 characters and are blank when they have no character outside JavaScript whitespace (U+FEFF counts). At most 64 tags. `context` is at most 2^53 − 1. Ids, providers, and tags together at most 100000 characters |
+| `request_id` | stored only when it matches `^req_[A-Za-z0-9]{8,64}$` and contains no configured secret |
+| `selection_priority` | `quality`, `balanced`, or `cheapest` |
+| route call | one attempt; async `asyncio.timeout` deadline; sync timeout per HTTP operation; a response after the deadline is discarded on both paths. A resumed run reuses the stored model while it is still eligible and selects again otherwise |
+| `no_eligible_candidate` | the agent's own model. The fallback is filtered by the same eligibility rule, so it is not used when no candidate is eligible |

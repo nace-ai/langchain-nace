@@ -23,3 +23,5 @@ check_imports:
 examples:
 	uv run python examples/support_agent.py
 	uv run python examples/langgraph_router.py
+	uv run python examples/model_selection_agent.py
+	uv run python examples/langgraph_model_selection.py
