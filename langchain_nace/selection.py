@@ -547,14 +547,8 @@ def apply_outcome(outcome: ExchangeOutcome) -> ModelSelection:
     return selection
 
 
-def _raise_if_interrupted(error: BaseException) -> None:
-    """Raise a `KeyboardInterrupt` or `CancelledError` buried under a cleanup error."""
-    interruption = _buried_interruption(error)
-    if interruption is not None:
-        raise interruption
-
-
-def _buried_interruption(error: BaseException) -> BaseException | None:
+def _buried_keyboard_interrupt(error: BaseException) -> KeyboardInterrupt | None:
+    """Return a `KeyboardInterrupt` hidden under a cleanup error, if there is one."""
     pending = [error]
     seen: set[int] = set()
     while pending:
@@ -563,7 +557,7 @@ def _buried_interruption(error: BaseException) -> BaseException | None:
         if marker in seen:
             continue
         seen.add(marker)
-        if isinstance(current, KeyboardInterrupt | asyncio.CancelledError):
+        if isinstance(current, KeyboardInterrupt):
             return current
         if current.__cause__ is not None:
             pending.append(current.__cause__)
@@ -572,15 +566,120 @@ def _buried_interruption(error: BaseException) -> BaseException | None:
     return None
 
 
-def _raise_if_caller_cancelled(error: BaseException) -> None:
-    """Raise when the caller cancelled and the deadline did not consume that cancel.
+def _deadline_expired(deadline: object | None) -> bool:
+    """Whether this `asyncio.timeout` scope fired. A stand-in scope counts as not fired."""
+    expired = getattr(deadline, "expired", None)
+    if not callable(expired):
+        return False
+    return bool(expired())
 
-    `asyncio.timeout` uncancels the cancel it added before it raises `TimeoutError`.
-    A remaining cancellation count belongs to the caller.
+
+def _own_deadline_reached(deadline: object | None, started: float, timeout: float) -> bool:
+    """Whether our deadline fired, or the clock is already past it."""
+    if _deadline_expired(deadline):
+        return True
+    return time.perf_counter() - started >= timeout
+
+
+def _deadline_holds_its_cancel(deadline: object | None) -> bool:
+    """Whether our deadline's cancel is still pending.
+
+    `Timeout.__aexit__` releases that cancel on the way out, including when a
+    cleanup error replaces it. Once the scope has finished, a pending cancel
+    belongs to the caller.
     """
-    task = asyncio.current_task()
-    if task is not None and task.cancelling():
-        raise asyncio.CancelledError from error
+    state = getattr(deadline, "_state", None)
+    return getattr(state, "value", None) == "expiring"
+
+
+def _caller_cancel_pending(deadline: object | None) -> bool:
+    """Whether `task.cancelling()` is above the count our deadline still holds."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        return False
+    if task is None:
+        return False
+    owned = 1 if _deadline_holds_its_cancel(deadline) else 0
+    return task.cancelling() > owned
+
+
+def _raise_caller_interruption(error: BaseException | None, deadline: object | None) -> None:
+    """Raise a caller interruption. A deadline's own cancel is not one."""
+    if error is not None:
+        keyboard = _buried_keyboard_interrupt(error)
+        if keyboard is not None:
+            raise keyboard
+    if _caller_cancel_pending(deadline):
+        raise asyncio.CancelledError
+
+
+def _finish_exchange(
+    *,
+    error: BaseException | None,
+    response: nace_sdk.RouteResponse | None,
+    deadline: object | None,
+    started: float,
+    timeout: float,
+    priority: Priority,
+    sent_ids: Sequence[str],
+    candidate_ids: Sequence[str],
+    fallback_id: str | None,
+    min_probability: float | None,
+) -> ModelSelection:
+    """Classify the end of one route attempt, in a fixed order.
+
+    A caller interruption is raised. Our own deadline is `timeout`. Any other
+    error uses the documented reason. A response is validated.
+    """
+    _raise_caller_interruption(error, deadline)
+    latency_ms = _latency_ms(started)
+    if _own_deadline_reached(deadline, started, timeout):
+        return apply_outcome(
+            _timeout_outcome(
+                priority=priority,
+                sent_ids=sent_ids,
+                candidate_ids=candidate_ids,
+                fallback_id=fallback_id,
+                min_probability=min_probability,
+                latency_ms=latency_ms,
+            )
+        )
+    if error is not None:
+        return apply_outcome(
+            _outcome_for_failure(
+                error,
+                started=started,
+                timeout=timeout,
+                priority=priority,
+                sent_ids=sent_ids,
+                candidate_ids=candidate_ids,
+                fallback_id=fallback_id,
+                min_probability=min_probability,
+            )
+        )
+    if response is None:
+        return apply_outcome(
+            _connection_outcome(
+                priority=priority,
+                sent_ids=sent_ids,
+                candidate_ids=candidate_ids,
+                fallback_id=fallback_id,
+                min_probability=min_probability,
+                latency_ms=latency_ms,
+            )
+        )
+    return apply_outcome(
+        _from_response(
+            response,
+            priority=priority,
+            sent_ids=sent_ids,
+            candidate_ids=candidate_ids,
+            fallback_id=fallback_id,
+            min_probability=min_probability,
+            latency_ms=latency_ms,
+        )
+    )
 
 
 def route_exchange(
@@ -597,11 +696,10 @@ def route_exchange(
 ) -> ModelSelection:
     """Send one route request, wait, apply the deadline, and close.
 
-    The sync deadline is the SDK timeout, which bounds each HTTP operation, plus
-    the elapsed time after a response returns. A late response is `timeout`. One
-    attempt is made (`max_retries=0`). `NaceError` and `httpx.HTTPError` use the
-    status table. Any other `Exception` is `connection_error`. Caller cancellation
-    does not apply on this path. A response is closed before this function returns.
+    The ending is classified by `_finish_exchange`: a buried `KeyboardInterrupt`
+    is raised, our deadline is `timeout`, and any other error uses the documented
+    reason. One attempt is made (`max_retries=0`). A response is closed before
+    this function returns.
     """
     started = time.perf_counter()
     response: nace_sdk.RouteResponse | None = None
@@ -613,57 +711,31 @@ def route_exchange(
             retry=_NO_RETRY,
             timeout=timeout,
         )
-        if time.perf_counter() - started >= timeout:
-            _close_route_response(response)
-            response = None
-            return apply_outcome(
-                _timeout_outcome(
-                    priority=priority,
-                    sent_ids=sent_ids,
-                    candidate_ids=candidate_ids,
-                    fallback_id=fallback_id,
-                    min_probability=min_probability,
-                    latency_ms=_latency_ms(started),
-                )
-            )
-        return apply_outcome(
-            _from_response(
-                response,
-                priority=priority,
-                sent_ids=sent_ids,
-                candidate_ids=candidate_ids,
-                fallback_id=fallback_id,
-                min_probability=min_probability,
-                latency_ms=_latency_ms(started),
-            )
-        )
-    except (nace_sdk.NaceError, httpx.HTTPError) as error:
-        _raise_if_interrupted(error)
-        return apply_outcome(
-            _outcome_for_failure(
-                error,
-                started=started,
-                timeout=timeout,
-                priority=priority,
-                sent_ids=sent_ids,
-                candidate_ids=candidate_ids,
-                fallback_id=fallback_id,
-                min_probability=min_probability,
-            )
-        )
     except Exception as error:
-        _raise_if_interrupted(error)
-        return apply_outcome(
-            _outcome_for_failure(
-                error,
-                started=started,
-                timeout=timeout,
-                priority=priority,
-                sent_ids=sent_ids,
-                candidate_ids=candidate_ids,
-                fallback_id=fallback_id,
-                min_probability=min_probability,
-            )
+        return _finish_exchange(
+            error=error,
+            response=None,
+            deadline=None,
+            started=started,
+            timeout=timeout,
+            priority=priority,
+            sent_ids=sent_ids,
+            candidate_ids=candidate_ids,
+            fallback_id=fallback_id,
+            min_probability=min_probability,
+        )
+    else:
+        return _finish_exchange(
+            error=None,
+            response=response,
+            deadline=None,
+            started=started,
+            timeout=timeout,
+            priority=priority,
+            sent_ids=sent_ids,
+            candidate_ids=candidate_ids,
+            fallback_id=fallback_id,
+            min_probability=min_probability,
         )
     finally:
         _close_route_response(response)
@@ -683,10 +755,10 @@ async def aroute_exchange(
 ) -> ModelSelection:
     """Async twin of `route_exchange`.
 
-    The wait is bounded by `asyncio.timeout`. A caller cancellation propagates,
-    including when it is still pending after a successful return, and no
-    selection is returned. `TimeoutError` is `timeout` only when that deadline
-    expired. Any other `Exception` is `connection_error`.
+    The wait is bounded by `asyncio.timeout`. `_finish_exchange` raises a caller
+    cancellation before it treats our deadline as `timeout`, so a late response
+    does not hide a pending cancel. A `TimeoutError` before the deadline is
+    `connection_error`.
     """
     started = time.perf_counter()
     response: nace_sdk.RouteResponse | None = None
@@ -700,103 +772,31 @@ async def aroute_exchange(
                 retry=_NO_RETRY,
                 timeout=timeout,
             )
-        if deadline.expired() or time.perf_counter() - started >= timeout:
-            _close_route_response(response)
-            response = None
-            return apply_outcome(
-                _timeout_outcome(
-                    priority=priority,
-                    sent_ids=sent_ids,
-                    candidate_ids=candidate_ids,
-                    fallback_id=fallback_id,
-                    min_probability=min_probability,
-                    latency_ms=_latency_ms(started),
-                )
-            )
-        task = asyncio.current_task()
-        if task is not None and task.cancelling():
-            _close_route_response(response)
-            response = None
-            raise asyncio.CancelledError
-        return apply_outcome(
-            _from_response(
-                response,
-                priority=priority,
-                sent_ids=sent_ids,
-                candidate_ids=candidate_ids,
-                fallback_id=fallback_id,
-                min_probability=min_probability,
-                latency_ms=_latency_ms(started),
-            )
-        )
-    except TimeoutError as caught:
-        # A caller cancel in the same loop step as the deadline stays a cancellation.
-        # The SDK's own timeout is a TimeoutError too; a hook's TimeoutError is not.
-        _raise_if_caller_cancelled(caught)
-        if isinstance(caught, nace_sdk.NaceError):
-            _raise_if_interrupted(caught)
-            return apply_outcome(
-                _outcome_for_failure(
-                    caught,
-                    started=started,
-                    timeout=timeout,
-                    priority=priority,
-                    sent_ids=sent_ids,
-                    candidate_ids=candidate_ids,
-                    fallback_id=fallback_id,
-                    min_probability=min_probability,
-                )
-            )
-        if deadline.expired():
-            return apply_outcome(
-                _timeout_outcome(
-                    priority=priority,
-                    sent_ids=sent_ids,
-                    candidate_ids=candidate_ids,
-                    fallback_id=fallback_id,
-                    min_probability=min_probability,
-                    latency_ms=_latency_ms(started),
-                )
-            )
-        return apply_outcome(
-            _connection_outcome(
-                priority=priority,
-                sent_ids=sent_ids,
-                candidate_ids=candidate_ids,
-                fallback_id=fallback_id,
-                min_probability=min_probability,
-                latency_ms=_latency_ms(started),
-            )
-        )
-    except (nace_sdk.NaceError, httpx.HTTPError) as error:
-        _raise_if_caller_cancelled(error)
-        _raise_if_interrupted(error)
-        return apply_outcome(
-            _outcome_for_failure(
-                error,
-                started=started,
-                timeout=timeout,
-                priority=priority,
-                sent_ids=sent_ids,
-                candidate_ids=candidate_ids,
-                fallback_id=fallback_id,
-                min_probability=min_probability,
-            )
-        )
     except Exception as error:
-        _raise_if_caller_cancelled(error)
-        _raise_if_interrupted(error)
-        return apply_outcome(
-            _outcome_for_failure(
-                error,
-                started=started,
-                timeout=timeout,
-                priority=priority,
-                sent_ids=sent_ids,
-                candidate_ids=candidate_ids,
-                fallback_id=fallback_id,
-                min_probability=min_probability,
-            )
+        return _finish_exchange(
+            error=error,
+            response=None,
+            deadline=deadline,
+            started=started,
+            timeout=timeout,
+            priority=priority,
+            sent_ids=sent_ids,
+            candidate_ids=candidate_ids,
+            fallback_id=fallback_id,
+            min_probability=min_probability,
+        )
+    else:
+        return _finish_exchange(
+            error=None,
+            response=response,
+            deadline=deadline,
+            started=started,
+            timeout=timeout,
+            priority=priority,
+            sent_ids=sent_ids,
+            candidate_ids=candidate_ids,
+            fallback_id=fallback_id,
+            min_probability=min_probability,
         )
     finally:
         _close_route_response(response)
@@ -1301,18 +1301,23 @@ def _safe_request_id(value: object) -> str | None:
 
 
 def _contains_image(value: object, depth: int) -> bool:
-    """Whether `value` is an image block or nests one, up to `_MAX_IMAGE_DEPTH`."""
+    """Whether `value` is an image block or nests one in any list or mapping value.
+
+    Past `_MAX_IMAGE_DEPTH`, a nested container counts as an image, so a candidate
+    that takes no images never gets content that the scan did not read.
+    """
     if _is_image_block(value):
         return True
-    if depth >= _MAX_IMAGE_DEPTH:
-        return False
-    if isinstance(value, list):
-        return any(_contains_image(item, depth + 1) for item in value)
     if isinstance(value, dict):
-        nested = value.get("content")
-        if isinstance(nested, list):
-            return any(_contains_image(item, depth + 1) for item in nested)
-    return False
+        children: list[object] = list(value.values())
+    elif isinstance(value, list):
+        children = value
+    else:
+        return False
+    nested = [child for child in children if isinstance(child, (dict, list))]
+    if depth >= _MAX_IMAGE_DEPTH:
+        return bool(nested)
+    return any(_contains_image(child, depth + 1) for child in nested)
 
 
 def _is_image_block(block: object) -> bool:
@@ -1563,7 +1568,8 @@ def _open_clients(
     if url.scheme not in {"http", "https"} or not url.host:
         message = "base_url must be an absolute http(s) URL."
         raise ValueError(message)
-    if _is_openrouter(endpoint) or url.host.removesuffix(".") == "openrouter.ai":
+    host = url.host.removesuffix(".").lower()
+    if _is_openrouter(endpoint) or host == "openrouter.ai" or host.endswith(".openrouter.ai"):
         message = "Drex Router is not available through OpenRouter; use a Nace endpoint."
         raise ValueError(message)
     if api_key is None:

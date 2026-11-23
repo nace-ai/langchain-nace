@@ -362,6 +362,8 @@ def test_headers_name_this_package() -> None:
         "https://openrouter.ai/api/v1",
         "https://openrouter.ai./api/v1",
         "https://openrouter。ai/api",
+        "https://eu.openrouter.ai/api/v1",
+        "https://EU.OpenRouter.ai./api/v1",
     ],
 )
 def test_openrouter_is_refused(base_url: str) -> None:
@@ -782,7 +784,15 @@ def test_nested_images_count() -> None:
         return block
 
     assert has_image_block([HumanMessage(content=[nest(3)])])
-    assert not has_image_block([HumanMessage(content=[nest(20)])])
+    # Past the depth limit the scan fails closed: unread content counts as an image.
+    assert has_image_block([HumanMessage(content=[nest(20)])])
+    bedrock = {"toolResult": {"toolUseId": "c1", "content": [{"image": {"format": "png"}}]}}
+    assert has_image_block([HumanMessage(content=[bedrock])])
+    upper = {"type": "file", "mime_type": "IMAGE/PNG", "base64": "AAAA"}
+    wrapped = {"type": "tool_result", "data": {"x": [upper]}}
+    assert has_image_block([HumanMessage(content=[wrapped])])
+    plain = {"type": "tool_result", "content": [{"type": "text", "text": "ok", "meta": {"a": [1]}}]}
+    assert not has_image_block([HumanMessage(content=[plain])])
 
 
 def test_keyboard_interrupt_is_not_hidden_by_a_close_error() -> None:
@@ -836,3 +846,29 @@ async def test_hook_timeout_before_the_deadline_is_connection_error(asynchronous
     assert selection["reason"] == "connection_error"
     assert selection["model"] == "strong"
     assert "TimeoutError" not in json.dumps(selection)
+
+
+def _block_then_timeout(request: httpx.Request) -> None:
+    del request
+    limit = time.perf_counter() + 0.05
+    while time.perf_counter() < limit:
+        pass
+    raise TimeoutError
+
+
+async def test_blocking_hook_past_the_deadline_is_timeout() -> None:
+    route = FakeRoute()
+    chosen = NaceModelSelector(
+        api_key="nace_sk_test",
+        base_url="https://drex.test",
+        candidates={"fast": None, "strong": None},
+        fallback="strong",
+        timeout=0.01,
+        http_async_client=httpx.AsyncClient(
+            transport=route.async_transport(),
+            event_hooks={"request": [_block_then_timeout]},
+        ),
+    )
+    selection = await chosen.aselect([HumanMessage("hello")])
+    assert selection["reason"] == "timeout"
+    assert selection["model"] == "strong"

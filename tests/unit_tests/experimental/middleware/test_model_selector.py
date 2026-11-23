@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -1032,4 +1033,68 @@ async def test_cancel_after_a_successful_route_skips_the_handler(
     with pytest.raises(NodeCancelledError) as caught:
         await graph.ainvoke({"messages": [HumanMessage("hello")]})
     assert isinstance(caught.value.__cause__, asyncio.CancelledError)
+    assert probe.requests == []
+
+
+async def test_deadline_close_error_uses_the_fallback_once() -> None:
+    class _Stream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> Any:
+            await asyncio.sleep(30)
+            yield b""
+
+        async def aclose(self) -> None:
+            raise RuntimeError("close failed")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, stream=_Stream())
+
+    selector = NaceModelSelector(
+        api_key="nace_sk_test",
+        base_url="https://drex.test",
+        timeout=0.05,
+        http_async_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    probe = Probe("deadline-close")
+    graph = agent(FakeRoute(), selector=selector, timeout=0.05, middleware=[probe])
+    result = await graph.ainvoke({"messages": [HumanMessage("hello")]})
+    assert result["nace_model_selection"]["reason"] == "timeout"
+    assert result["nace_model_selection"]["model"] == "strong"
+    assert result["messages"][-1].content == "from strong"
+    assert len(probe.requests) == 1
+    assert "close failed" not in json.dumps(result["nace_model_selection"])
+
+
+async def test_caller_cancel_and_late_response_skips_the_handler() -> None:
+    started = asyncio.Event()
+
+    class _Body:
+        def __init__(self) -> None:
+            self.selected = "fast"
+            self.probabilities = {"fast": 1.0, "strong": 0.0}
+            self.request_id = "req_Abcdefgh"
+
+    class _Late:
+        async def route(self, *_args: object, **_kwargs: object) -> _Body:
+            mark = time.perf_counter()
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                while time.perf_counter() < mark + 0.2:
+                    pass
+                return _Body()
+            return _Body()
+
+    selector = route_selector(FakeRoute(), timeout=0.2)
+    selector._aclient = _Late()  # type: ignore[assignment]
+    probe = Probe("late-cancel")
+    graph = agent(FakeRoute(), selector=selector, timeout=0.2, middleware=[probe])
+    task = asyncio.create_task(graph.ainvoke({"messages": [HumanMessage("hello")]}))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises((asyncio.CancelledError, NodeCancelledError)) as caught:
+        await task
+    if isinstance(caught.value, NodeCancelledError):
+        assert isinstance(caught.value.__cause__, asyncio.CancelledError)
     assert probe.requests == []
