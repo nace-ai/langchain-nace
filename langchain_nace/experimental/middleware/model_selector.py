@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NotRequired, cast
@@ -54,6 +56,25 @@ from langchain_nace.selection import (
 )
 
 _TOKEN_DIVISOR = 3
+_REQUEST_ID = re.compile(r"^req_[A-Za-z0-9]{8,64}$")
+_REASONS = frozenset(
+    {
+        "selected",
+        "low_probability",
+        "single_candidate",
+        "no_input",
+        "no_eligible_candidate",
+        "timeout",
+        "connection_error",
+        "rate_limited",
+        "unavailable",
+        "auth_error",
+        "no_funds",
+        "invalid_request",
+        "invalid_response",
+    }
+)
+_PRIORITIES = frozenset({"quality", "balanced", "cheapest"})
 
 
 @dataclass(frozen=True)
@@ -240,23 +261,18 @@ class NaceModelSelectorMiddleware(AgentMiddleware[_SelectorState, ContextT, Resp
     def _reusable(
         self, request: ModelRequest[ContextT], eligible: Sequence[CandidateBinding]
     ) -> ModelSelection | None:
-        """Return the stored selection when this request can still use it."""
+        """Return a copy of the stored selection when this request can still use it."""
         if self.select_on != "run":
             return None
         value = request.state.get("nace_model_selection")
-        try:
-            if not isinstance(value, Mapping) or "model" not in value:
-                return None
-            model = value["model"]
-        except (KeyError, TypeError):
+        parsed = _stored_selection(value, bound_ids={binding.id for binding in self._bindings})
+        if parsed is None:
             return None
-        # None means the agent's own model. It has no candidate capability flags.
+        model = parsed["model"]
         if model is None:
-            return cast("ModelSelection", value)
-        configured = {binding.id for binding in self._bindings}
-        eligible_ids = {binding.id for binding in eligible}
-        if isinstance(model, str) and model in configured and model in eligible_ids:
-            return cast("ModelSelection", value)
+            return parsed
+        if model in {binding.id for binding in eligible}:
+            return parsed
         return None
 
     def _prepare(self, request: ModelRequest[ContextT]) -> _Prepared:
@@ -319,10 +335,83 @@ class NaceModelSelectorMiddleware(AgentMiddleware[_SelectorState, ContextT, Resp
 def _with_selection(
     response: ModelResponse[ResponseT], selection: ModelSelection
 ) -> ExtendedModelResponse[ResponseT]:
+    """Store a fresh mapping of the known fields. Never the caller's object."""
+    stored: ModelSelection = {
+        "model": selection["model"],
+        "selected": selection["selected"],
+        "probabilities": dict(selection["probabilities"]),
+        "fallback": selection["fallback"],
+        "reason": selection["reason"],
+        "priority": selection["priority"],
+        "candidates": list(selection["candidates"]),
+        "request_id": selection["request_id"],
+        "latency_ms": selection["latency_ms"],
+    }
     return ExtendedModelResponse(
         model_response=response,
-        command=Command(update={"nace_model_selection": dict(selection)}),
+        command=Command(update={"nace_model_selection": stored}),
     )
+
+
+def _stored_selection(value: object, *, bound_ids: set[str]) -> ModelSelection | None:
+    """Return a clean copy when `value` is a well-formed selection, else `None`."""
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        model = value["model"]
+        selected = value["selected"]
+        probabilities = value["probabilities"]
+        fallback = value["fallback"]
+        reason = value["reason"]
+        priority = value["priority"]
+        candidates = value["candidates"]
+        request_id = value["request_id"]
+        latency_ms = value["latency_ms"]
+    except (KeyError, TypeError):
+        return None
+    if model is not None and (not isinstance(model, str) or model not in bound_ids):
+        return None
+    if reason not in _REASONS or priority not in _PRIORITIES or not isinstance(fallback, bool):
+        return None
+    if not isinstance(candidates, list) or not all(isinstance(item, str) for item in candidates):
+        return None
+    if selected is not None and (not isinstance(selected, str) or selected not in candidates):
+        return None
+    if request_id is not None and (
+        not isinstance(request_id, str) or _REQUEST_ID.fullmatch(request_id) is None
+    ):
+        return None
+    if latency_ms is not None and (
+        isinstance(latency_ms, bool) or not isinstance(latency_ms, int) or latency_ms < 0
+    ):
+        return None
+    parsed = _probability_map(probabilities)
+    if parsed is None:
+        return None
+    return {
+        "model": model,
+        "selected": selected,
+        "probabilities": parsed,
+        "fallback": fallback,
+        "reason": cast("Any", reason),
+        "priority": cast("Any", priority),
+        "candidates": list(candidates),
+        "request_id": request_id,
+        "latency_ms": latency_ms,
+    }
+
+
+def _probability_map(value: object) -> dict[str, float] | None:
+    if not isinstance(value, Mapping):
+        return None
+    parsed: dict[str, float] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or isinstance(item, bool) or not isinstance(item, int | float):
+            return None
+        if not math.isfinite(item) or item < 0 or item > 1:
+            return None
+        parsed[key] = float(item)
+    return parsed
 
 
 def _fallback_id(

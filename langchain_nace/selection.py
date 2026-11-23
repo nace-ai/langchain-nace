@@ -72,6 +72,7 @@ _OutcomeKind = Literal[
 
 _CHAR_BUDGET = 24_000
 _MAX_ROUTE_MESSAGES = 1024
+_MAX_IMAGE_DEPTH = 8
 _MAX_CANDIDATES = 255
 _MAX_ID_LENGTH = 256
 _MAX_PROFILE_TEXT = 128
@@ -187,8 +188,8 @@ class ExchangeOutcome:
     candidate_ids: tuple[str, ...] = ()
     fallback_id: str | None = None
     min_probability: float | None = None
-    selected: Any = None
-    probabilities: Any = None
+    selected: Any = field(default=None, repr=False)
+    probabilities: Any = field(default=None, repr=False)
     status: int | None = None
     request_id: str | None = None
     latency_ms: int | None = None
@@ -366,14 +367,7 @@ def has_image_block(
     if system_message is not None:
         pending.append(system_message)
     pending.extend(messages)
-    for message in pending:
-        content = message.content
-        if isinstance(content, str):
-            continue
-        for block in content:
-            if _is_image_block(block):
-                return True
-    return False
+    return any(_contains_image(message.content, 0) for message in pending)
 
 
 def project_route_messages(
@@ -553,6 +547,31 @@ def apply_outcome(outcome: ExchangeOutcome) -> ModelSelection:
     return selection
 
 
+def _raise_if_interrupted(error: BaseException) -> None:
+    """Raise a `KeyboardInterrupt` or `CancelledError` buried under a cleanup error."""
+    interruption = _buried_interruption(error)
+    if interruption is not None:
+        raise interruption
+
+
+def _buried_interruption(error: BaseException) -> BaseException | None:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if isinstance(current, KeyboardInterrupt | asyncio.CancelledError):
+            return current
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return None
+
+
 def _raise_if_caller_cancelled(error: BaseException) -> None:
     """Raise when the caller cancelled and the deadline did not consume that cancel.
 
@@ -619,6 +638,7 @@ def route_exchange(
             )
         )
     except (nace_sdk.NaceError, httpx.HTTPError) as error:
+        _raise_if_interrupted(error)
         return apply_outcome(
             _outcome_for_failure(
                 error,
@@ -632,6 +652,7 @@ def route_exchange(
             )
         )
     except Exception as error:
+        _raise_if_interrupted(error)
         return apply_outcome(
             _outcome_for_failure(
                 error,
@@ -662,15 +683,16 @@ async def aroute_exchange(
 ) -> ModelSelection:
     """Async twin of `route_exchange`.
 
-    The wait is bounded by `asyncio.timeout`. A caller cancellation propagates
-    from every error branch when the task still has a cancel the deadline did
-    not consume, and no fallback is returned. A response that arrives after the
-    deadline is discarded. Any other `Exception` is `connection_error`.
+    The wait is bounded by `asyncio.timeout`. A caller cancellation propagates,
+    including when it is still pending after a successful return, and no
+    selection is returned. `TimeoutError` is `timeout` only when that deadline
+    expired. Any other `Exception` is `connection_error`.
     """
     started = time.perf_counter()
     response: nace_sdk.RouteResponse | None = None
+    deadline = asyncio.timeout(timeout)
     try:
-        async with asyncio.timeout(timeout):
+        async with deadline:
             response = await client.route(
                 cast("Sequence[nace_sdk.RouteMessage]", list(messages)),
                 cast("Sequence[nace_sdk.RouteCandidate]", list(candidates)),
@@ -678,7 +700,7 @@ async def aroute_exchange(
                 retry=_NO_RETRY,
                 timeout=timeout,
             )
-        if time.perf_counter() - started >= timeout:
+        if deadline.expired() or time.perf_counter() - started >= timeout:
             _close_route_response(response)
             response = None
             return apply_outcome(
@@ -691,6 +713,11 @@ async def aroute_exchange(
                     latency_ms=_latency_ms(started),
                 )
             )
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            _close_route_response(response)
+            response = None
+            raise asyncio.CancelledError
         return apply_outcome(
             _from_response(
                 response,
@@ -704,9 +731,35 @@ async def aroute_exchange(
         )
     except TimeoutError as caught:
         # A caller cancel in the same loop step as the deadline stays a cancellation.
+        # The SDK's own timeout is a TimeoutError too; a hook's TimeoutError is not.
         _raise_if_caller_cancelled(caught)
+        if isinstance(caught, nace_sdk.NaceError):
+            _raise_if_interrupted(caught)
+            return apply_outcome(
+                _outcome_for_failure(
+                    caught,
+                    started=started,
+                    timeout=timeout,
+                    priority=priority,
+                    sent_ids=sent_ids,
+                    candidate_ids=candidate_ids,
+                    fallback_id=fallback_id,
+                    min_probability=min_probability,
+                )
+            )
+        if deadline.expired():
+            return apply_outcome(
+                _timeout_outcome(
+                    priority=priority,
+                    sent_ids=sent_ids,
+                    candidate_ids=candidate_ids,
+                    fallback_id=fallback_id,
+                    min_probability=min_probability,
+                    latency_ms=_latency_ms(started),
+                )
+            )
         return apply_outcome(
-            _timeout_outcome(
+            _connection_outcome(
                 priority=priority,
                 sent_ids=sent_ids,
                 candidate_ids=candidate_ids,
@@ -717,6 +770,7 @@ async def aroute_exchange(
         )
     except (nace_sdk.NaceError, httpx.HTTPError) as error:
         _raise_if_caller_cancelled(error)
+        _raise_if_interrupted(error)
         return apply_outcome(
             _outcome_for_failure(
                 error,
@@ -731,6 +785,7 @@ async def aroute_exchange(
         )
     except Exception as error:
         _raise_if_caller_cancelled(error)
+        _raise_if_interrupted(error)
         return apply_outcome(
             _outcome_for_failure(
                 error,
@@ -1155,6 +1210,26 @@ def _from_error(
     )
 
 
+def _connection_outcome(
+    *,
+    priority: Priority,
+    sent_ids: Sequence[str],
+    candidate_ids: Sequence[str],
+    fallback_id: str | None,
+    min_probability: float | None,
+    latency_ms: int,
+) -> ExchangeOutcome:
+    return ExchangeOutcome(
+        kind="connection_error",
+        priority=priority,
+        sent_ids=tuple(sent_ids),
+        candidate_ids=tuple(candidate_ids),
+        fallback_id=fallback_id,
+        min_probability=min_probability,
+        latency_ms=latency_ms,
+    )
+
+
 def _timeout_outcome(
     *,
     priority: Priority,
@@ -1223,6 +1298,21 @@ def _safe_request_id(value: object) -> str | None:
         if secret and secret in value:
             return None
     return value
+
+
+def _contains_image(value: object, depth: int) -> bool:
+    """Whether `value` is an image block or nests one, up to `_MAX_IMAGE_DEPTH`."""
+    if _is_image_block(value):
+        return True
+    if depth >= _MAX_IMAGE_DEPTH:
+        return False
+    if isinstance(value, list):
+        return any(_contains_image(item, depth + 1) for item in value)
+    if isinstance(value, dict):
+        nested = value.get("content")
+        if isinstance(nested, list):
+            return any(_contains_image(item, depth + 1) for item in nested)
+    return False
 
 
 def _is_image_block(block: object) -> bool:

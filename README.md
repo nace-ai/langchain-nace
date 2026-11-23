@@ -172,7 +172,7 @@ graph.add_conditional_edges("triage", edge, ["billing", "support", "human_review
 | Valid response, probability below `min_probability` | `low_probability` | fallback |
 | One eligible candidate | `single_candidate` | that candidate |
 | No human text | `no_input` | agent's own model |
-| No eligible candidate | `no_eligible_candidate` | fallback, else agent's own model |
+| No eligible candidate | `no_eligible_candidate` | agent's own model (the fallback is filtered by the same rule) |
 | Deadline passed | `timeout` | fallback |
 | Connection error | `connection_error` | fallback |
 | 429 | `rate_limited` | fallback |

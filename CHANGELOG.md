@@ -45,7 +45,10 @@ Notable changes per release. Versions before 0.2.0 have no changelog entry; the
   latest human message has no real text, including an image-only turn, the
   reason is `no_input` in both context modes and nothing is sent.
 - A stored selection is reused only when `model` is `None` or a configured
-  candidate id that is still eligible. Any other shape is ignored.
+  candidate id that is still eligible, and every field of the record is well
+  formed. Any other shape is ignored.
+- `no_eligible_candidate` uses the agent's own model. The fallback is filtered
+  by the same eligibility rule, so it is not used when no candidate is eligible.
 - A caller cancellation propagates, including when it is still pending after
   another error from the route exchange. The handler is not called. An error
   from the handler propagates and is not retried on the fallback.

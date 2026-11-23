@@ -240,6 +240,18 @@ def test_long_latest_human_is_cut_to_the_budget() -> None:
     assert projected == [{"role": "user", "content": "x" * 24_000}]
 
 
+def test_projection_reaches_both_caps() -> None:
+    many = project_route_messages([HumanMessage("h")] + [AIMessage("a")] * 2000)
+    assert len(many) == 1024
+    packed = project_route_messages(
+        [HumanMessage("h"), AIMessage("a" * 20_000), AIMessage("b" * 20_000)]
+    )
+    total = sum(len(turn["content"]) for turn in packed)
+    assert total <= 24_000
+    assert "b" * 20_000 in [turn["content"] for turn in packed]
+    assert "a" * 20_000 not in [turn["content"] for turn in packed]
+
+
 def test_message_cap_keeps_the_latest_human() -> None:
     projected = project_route_messages([HumanMessage("keep")] + [AIMessage("a")] * 1100)
     assert len(projected) == 1024
@@ -560,10 +572,10 @@ def test_profile_text_limits() -> None:
 
 
 def test_request_id_equal_to_the_api_key_is_dropped(caplog: pytest.LogCaptureFixture) -> None:
-    key = "nace_sk_test"
+    key = "req_Secret12345"
     route = FakeRoute(replies=[route_ok("fast", {"fast": 0.7, "strong": 0.3}, request_id=key)])
     with caplog.at_level(logging.DEBUG):
-        chosen = selector(route).select([HumanMessage("hello")])
+        chosen = selector(route, api_key=key).select([HumanMessage("hello")])
     assert chosen["request_id"] is None
     assert key not in json.dumps(chosen)
     assert key not in caplog.text
@@ -740,3 +752,87 @@ async def test_async_response_after_the_deadline_is_timeout() -> None:
     assert selection["reason"] == "timeout"
     assert selection["model"] == "strong"
     assert selection["selected"] is None
+
+
+def test_exchange_outcome_repr_hides_the_raw_selection() -> None:
+    outcome = ExchangeOutcome(
+        kind="response",
+        priority="balanced",
+        selected="SECRET-SELECTED",
+        probabilities={"fast": "SECRET-PROB"},
+    )
+    text = repr(outcome)
+    assert "SECRET-SELECTED" not in text
+    assert "SECRET-PROB" not in text
+
+
+def test_nested_images_count() -> None:
+    image = {"type": "image", "base64": "AAAA", "mime_type": "image/png"}
+    tool_result = {"type": "tool_result", "tool_use_id": "c1", "content": [image]}
+    assert has_image_block([HumanMessage(content=[{"type": "text", "text": "see"}, tool_result])])
+    assert has_image_block(
+        [ToolMessage(content=[{"type": "tool_result", "content": [image]}], tool_call_id="c1")]
+    )
+    assert has_image_block([ToolMessage(content=[image], tool_call_id="c1")])
+
+    def nest(depth: int) -> dict[str, object]:
+        block: dict[str, object] = dict(image)
+        for _ in range(depth):
+            block = {"type": "tool_result", "content": [block]}
+        return block
+
+    assert has_image_block([HumanMessage(content=[nest(3)])])
+    assert not has_image_block([HumanMessage(content=[nest(20)])])
+
+
+def test_keyboard_interrupt_is_not_hidden_by_a_close_error() -> None:
+    class Stream(httpx.SyncByteStream):
+        def __iter__(self) -> object:
+            raise KeyboardInterrupt
+
+        def close(self) -> None:
+            raise httpx.ReadError("closed")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, stream=Stream())
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    chosen = NaceModelSelector(
+        api_key="nace_sk_test",
+        base_url="https://drex.test",
+        candidates={"fast": None, "strong": None},
+        fallback="strong",
+        timeout=30,
+        http_client=client,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        chosen.select([HumanMessage("hello")])
+
+
+def _raise_timeout(request: httpx.Request) -> None:
+    del request
+    raise TimeoutError
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_hook_timeout_before_the_deadline_is_connection_error(asynchronous: bool) -> None:
+    route = FakeRoute()
+    chosen = NaceModelSelector(
+        api_key="nace_sk_test",
+        base_url="https://drex.test",
+        candidates={"fast": None, "strong": None},
+        fallback="strong",
+        timeout=30,
+        http_client=httpx.Client(
+            transport=route.transport(), event_hooks={"request": [_raise_timeout]}
+        ),
+        http_async_client=httpx.AsyncClient(
+            transport=route.async_transport(), event_hooks={"request": [_raise_timeout]}
+        ),
+    )
+    messages = [HumanMessage("hello")]
+    selection = await chosen.aselect(messages) if asynchronous else chosen.select(messages)
+    assert selection["reason"] == "connection_error"
+    assert selection["model"] == "strong"
+    assert "TimeoutError" not in json.dumps(selection)

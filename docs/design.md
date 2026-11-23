@@ -290,3 +290,4 @@ classDiagram
 | `request_id` | stored only when it matches `^req_[A-Za-z0-9]{8,64}$` and contains no configured secret |
 | `selection_priority` | `quality`, `balanced`, or `cheapest` |
 | route call | one attempt; async `asyncio.timeout` deadline; sync timeout per HTTP operation; a response after the deadline is discarded on both paths. A resumed run reuses the stored model while it is still eligible and selects again otherwise |
+| `no_eligible_candidate` | the agent's own model. The fallback is filtered by the same eligibility rule, so it is not used when no candidate is eligible |

@@ -812,15 +812,148 @@ def test_malformed_stored_selection_selects_again() -> None:
             handler,
         )
     assert seen == [fast, fast, fast, fast]
+    incomplete = {"model": None}
     mw.wrap_model_call(
         _request(
             own,
             [HumanMessage("hi")],
-            state={"messages": [], "nace_model_selection": {"model": None}},
+            state={"messages": [], "nace_model_selection": incomplete},
         ),
         handler,
     )
+    assert seen[-1] is fast
+    written = mw.wrap_model_call(
+        _request(
+            own,
+            [HumanMessage("again")],
+            state={
+                "messages": [],
+                "nace_model_selection": _complete(model=None, reason="no_input"),
+            },
+        ),
+        handler,
+    ).command.update["nace_model_selection"]  # type: ignore[index]
     assert seen[-1] is own
+    assert written is not None
+    assert written["model"] is None
+
+
+def _complete(**overrides: object) -> dict[str, object]:
+    record: dict[str, object] = {
+        "model": "fast",
+        "selected": "fast",
+        "probabilities": {"fast": 1.0},
+        "fallback": False,
+        "reason": "selected",
+        "priority": "balanced",
+        "candidates": ["fast", "strong"],
+        "request_id": "req_Abcdefgh",
+        "latency_ms": 3,
+    }
+    record.update(overrides)
+    return record
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"request_id": "plaintext"},
+        {"reason": "nope"},
+        {"fallback": "yes"},
+        {"probabilities": {"fast": 2}},
+        {"selected": "other"},
+        {"candidates": "fast"},
+    ],
+)
+def test_ill_formed_stored_record_is_not_written_back(bad: dict[str, object]) -> None:
+    route = FakeRoute(replies=[route_ok("strong", {"fast": 0.2, "strong": 0.8})])
+    own = scripted(AIMessage("own"))
+    fast = scripted(AIMessage("from fast"))
+    strong = scripted(AIMessage("from strong"))
+    mw = middleware(route, fast=fast, strong=strong, selector=route_selector(route))
+    original = _complete(**bad)
+    seen: list[Any] = []
+
+    def handler(request: ModelRequest) -> AIMessage:
+        seen.append(request.model)
+        return AIMessage("ok")
+
+    result = mw.wrap_model_call(
+        _request(
+            own,
+            [HumanMessage("hi")],
+            state={"messages": [], "nace_model_selection": original},
+        ),
+        handler,
+    )
+    stored = result.command.update["nace_model_selection"]  # type: ignore[index]
+    assert stored is not original
+    assert seen == [strong]
+    assert stored["model"] == "strong"
+    assert stored["request_id"] != "plaintext"
+
+
+def test_stored_record_does_not_keep_extra_keys() -> None:
+    route = FakeRoute()
+    own = scripted(AIMessage("own"))
+    fast = scripted(AIMessage("from fast"))
+    mw = middleware(route, fast=fast, selector=route_selector(route))
+    original = _complete(note="CANARY")
+    seen: list[Any] = []
+
+    def handler(request: ModelRequest) -> AIMessage:
+        seen.append(request.model)
+        return AIMessage("ok")
+
+    result = mw.wrap_model_call(
+        _request(
+            own,
+            [HumanMessage("hi")],
+            state={"messages": [], "nace_model_selection": original},
+        ),
+        handler,
+    )
+    stored = result.command.update["nace_model_selection"]  # type: ignore[index]
+    assert seen == [fast]
+    assert route.requests == []
+    assert "CANARY" not in json.dumps(stored)
+    assert stored is not original
+
+
+def test_nested_tool_result_image_drops_a_blind_candidate() -> None:
+    route = FakeRoute(replies=[route_ok("blind", {"blind": 0.8, "vision": 0.2})])
+    blind = scripted(AIMessage("from blind"))
+    vision = scripted(AIMessage("from vision"))
+    mw = middleware(
+        route,
+        candidates={
+            "blind": ModelCandidate(blind, images=False),
+            "vision": ModelCandidate(vision),
+        },
+        fallback="vision",
+        selector=route_selector(route),
+    )
+    seen: list[Any] = []
+
+    def handler(request: ModelRequest) -> AIMessage:
+        seen.append(request.model)
+        return AIMessage("ok")
+
+    picture = HumanMessage(
+        content=[
+            {"type": "text", "text": "see"},
+            {
+                "type": "tool_result",
+                "tool_use_id": "c1",
+                "content": [{"type": "image", "base64": "AAAA", "mime_type": "image/png"}],
+            },
+        ]
+    )
+    result = mw.wrap_model_call(_request(scripted(AIMessage("own")), [picture]), handler)
+    stored = result.command.update["nace_model_selection"]  # type: ignore[index]
+    assert seen == [vision]
+    assert stored["model"] == "vision"
+    assert stored["reason"] == "single_candidate"
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -874,4 +1007,29 @@ async def test_cancel_during_read_when_close_raises_read_error() -> None:
         await task
     if isinstance(caught.value, NodeCancelledError):
         assert isinstance(caught.value.__cause__, asyncio.CancelledError)
+    assert probe.requests == []
+
+
+async def test_cancel_after_a_successful_route_skips_the_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Pending:
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+
+        def expired(self) -> bool:
+            return False
+
+    monkeypatch.setattr(asyncio, "timeout", lambda _delay: _Pending())
+    route = FakeRoute()
+    probe = Probe("after-return")
+    graph = agent(route, timeout=30, middleware=[probe])
+    with pytest.raises(NodeCancelledError) as caught:
+        await graph.ainvoke({"messages": [HumanMessage("hello")]})
+    assert isinstance(caught.value.__cause__, asyncio.CancelledError)
     assert probe.requests == []
