@@ -109,6 +109,105 @@ chain = router.branch(
 
 LangGraph: `nace_conditional_edge(classifier, question, state=..., min_confidence=0.7)` is a path function for `add_conditional_edges`. Below the threshold it returns `"human_review"`, so that node can `interrupt()` for a person. See [`examples/langgraph_router.py`](https://github.com/nace-ai/langchain-nace/blob/main/examples/langgraph_router.py).
 
+## Model selection with Drex Router
+
+Decision routing and model selection do different jobs. Decision routing uses a `Choice` question you write. `NaceClassifier` picks a label, and a conditional edge sends the request to that branch. Model selection uses a model trained to choose among candidate models.
+
+One support request uses both:
+
+1. The request arrives.
+2. `NaceClassifier` answers a `Choice` question: "billing" or "support". The edge sends the request to the billing agent or the support agent. This is decision routing.
+3. Inside the chosen agent, `NaceModelSelectorMiddleware` sends the conversation and the candidates to `POST /v1/route`. Drex Router selects the generative model. This is model selection.
+
+The candidate id is the id Drex knows. `ModelCandidate.model` is the chat model LangChain runs. A bare id must be a known router id. Any other model needs a `CandidateProfile` (`provider`, `price_in`, `price_out`, `context`, `tags`). Drex Router is not available through OpenRouter.
+
+```python
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage
+from langchain_nace.experimental.middleware import ModelCandidate, NaceModelSelectorMiddleware
+
+selector = NaceModelSelectorMiddleware(
+    candidates={
+        "openai/gpt-4o-mini": ModelCandidate("openai:gpt-5-mini"),
+        "anthropic/claude-haiku-5.5": ModelCandidate("anthropic:claude-opus-5-5"),
+    },
+    priority="balanced",
+    fallback="openai/gpt-4o-mini",
+)
+agent = create_agent("openai:gpt-5-mini", tools=tools, middleware=[selector])
+result = agent.invoke({"messages": [HumanMessage("I was charged twice. Please refund one.")]})
+result["nace_model_selection"]
+```
+
+List the selector first in `middleware`. Do not combine it with `NaceModelRouterMiddleware`. Both choose the model. The full flow is [`examples/langgraph_model_selection.py`](https://github.com/nace-ai/langchain-nace/blob/main/examples/langgraph_model_selection.py):
+
+```python
+from langchain_nace import Choice, NaceClassifier, nace_conditional_edge
+
+teams = Choice(
+    instructions="Which team should own this support request?",
+    criteria={"billing": "Charges, invoices, refunds.", "support": "Bugs and outages."},
+)
+edge = nace_conditional_edge(
+    NaceClassifier(), teams, state=lambda state: state["text"], min_confidence=0.7
+)
+graph.add_conditional_edges("triage", edge, ["billing", "support", "human_review"])
+# The billing and support nodes each run create_agent(..., middleware=[selector]).
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `candidates` | required | Candidate id to `ModelCandidate(model, profile=None, images=True, tools=True)`. `model` is a chat model or a name for `init_chat_model`. |
+| `priority` | `"balanced"` | `"quality"`, `"balanced"`, or `"cheapest"`. |
+| `fallback` | `None` | Candidate id used when Drex does not return a usable selection. `None` keeps the agent's own model. |
+| `min_probability` | `None` | Below this probability of the selected id, use `fallback`. |
+| `select_on` | `"run"` | `"run"` selects once per run. `"model_call"` selects on every model call. |
+| `context` | `"conversation"` | `"conversation"` sends the projected conversation. `"latest_human"` sends the system text and the latest human message. An empty or image-only latest human message sends nothing. |
+| `timeout` | `3` | Seconds for the route call. |
+| `selector` | `None` | A configured `NaceModelSelector`. When omitted, one is built from the environment. |
+
+| Outcome | `reason` | Model used |
+|---|---|---|
+| Valid response, probability at or above `min_probability` | `selected` | selected candidate |
+| Valid response, probability below `min_probability` | `low_probability` | fallback |
+| One eligible candidate | `single_candidate` | that candidate |
+| No human text | `no_input` | agent's own model |
+| No eligible candidate | `no_eligible_candidate` | fallback, else agent's own model |
+| Deadline passed | `timeout` | fallback |
+| Connection error | `connection_error` | fallback |
+| 429 | `rate_limited` | fallback |
+| 5xx, including 503, 504, 529 | `unavailable` | fallback |
+| 401, 403 | `auth_error` | fallback |
+| 402 | `no_funds` | fallback |
+| 413, 422 | `invalid_request` | fallback |
+| Response fails validation | `invalid_response` | fallback |
+
+The route call is one attempt. Async code wraps it in `asyncio.timeout`, so the deadline is hard. A response that arrives later is discarded on both the sync and async paths. An error that arrives after the deadline is `timeout` on both paths. Sync code passes `timeout` to the SDK. That limit applies to each HTTP operation and is best effort. Caller cancellation is not a fallback. The cancellation is raised again, including when it arrives in the same event-loop step as the deadline, and when another error is raised while that cancellation is still pending. The route request is closed, and the handler is not called. An error raised by the handler propagates. The handler is not called again. Any other exception from the route exchange is `connection_error`.
+
+`/v1/route` receives text only. The system message is a `system` turn. A human message is a `user` turn. An assistant message's text is an `assistant` turn. Tool calls are dropped. Tool results are omitted. A non-text block becomes a placeholder. An image is a block of type `image`, `image_url`, or `input_image`, a block with an `image` key, or a `media` or `file` block whose mime type starts with `image/`. A request needs a tool-capable model when it has tools or a `response_format`. The latest human message is kept. The rest of the budget is filled with the newest other turns first, and the turns stay in chronological order, at most 24,000 characters and 1,024 messages. A human turn that is only a media placeholder is not text. If the latest human message has no real text, including an image-only turn, nothing is sent and the reason is `no_input` in both context modes.
+
+A profile provider is non-blank and at most 128 characters. Each tag is too, and there are at most 64 tags. A provider or tag is blank when it has no character outside JavaScript whitespace, and U+FEFF counts as whitespace. Prices are finite and at least 0. `context` is a positive integer up to 2^53 − 1. Ids, providers, and tags together must be at most 100000 characters.
+
+The selection is stored on the agent state under `nace_model_selection`:
+
+| Field | Value |
+|---|---|
+| `model` | Candidate id in use, or `None` when the agent's own model is in use |
+| `selected` | Id Drex returned, or `None` |
+| `probabilities` | Full map from Drex, or `{}` |
+| `fallback` | `True` when `model` is not the Drex selection |
+| `reason` | One value from the table above |
+| `priority` | Priority sent, or the default |
+| `candidates` | Ids sent |
+| `request_id` | Server request id, or `None`. Kept only when it matches `req_` plus 8 to 64 letters or digits, and it does not contain a configured secret |
+| `latency_ms` | Elapsed milliseconds, or `None` |
+
+The state holds no message text. A route call costs $0.02 per 1M encoded input tokens. Only a 200 is charged.
+
+`before_agent` sets `nace_model_selection` to `None`, so the model can change between runs on one thread. A resumed run reuses the stored selection while that model is still eligible and selects again otherwise. The agent's own model (`model` is `None`) is reused. A tool result that adds an image, a new tool, or a longer request selects again. A stored value that is not a mapping with `model` set to `None` or a configured candidate id is ignored. The state update is saved after the model call returns. An outer retry can route a second time. Put the selector first so nothing else runs before it. A caller-supplied HTTP client that raises `httpx.HTTPStatusError` is mapped by status code. Any other `httpx.HTTPError`, and any other exception from the exchange, is `connection_error`. The log has no message text and no response body.
+
+[`examples/model_selection_agent.py`](https://github.com/nace-ai/langchain-nace/blob/main/examples/model_selection_agent.py) runs one `create_agent`.
+
 ## Documents (NDI)
 
 Nace Document Intelligence (NDI) is the document side of the same API: it parses documents to Markdown, extracts structured fields and answers questions over the files in a workspace. It is cloud only, and uses the same `NACE_API_KEY` as Drex.
@@ -171,6 +270,8 @@ agent = create_agent(
 ```
 
 **`NaceModelRouterMiddleware`** picks the model once per run. Below `min_confidence` (0.6), or if Drex can't be reached, it uses `escalate_to` (the last choice by default). The decision and probabilities are kept in state under `nace_model_route`.
+
+**`NaceModelSelectorMiddleware`** asks Drex Router which candidate should answer. It selects on the first model call of a run and stores the result in `nace_model_selection`. List it first. Do not combine it with the model router. See [Model selection with Drex Router](#model-selection-with-drex-router).
 
 **`NaceAutoModeMiddleware`** checks each tool call before it runs. In one request Drex reads:
 - the user's **original request**, kept however long the run gets;

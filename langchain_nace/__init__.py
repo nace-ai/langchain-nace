@@ -25,6 +25,7 @@ from langchain_nace.errors import (
 )
 from langchain_nace.graph import nace_conditional_edge
 from langchain_nace.router import NaceLowConfidenceError, NaceRouter, RouteDecision
+from langchain_nace.selection import CandidateProfile, ModelSelection, NaceModelSelector
 from langchain_nace.tools import NaceExtractTool, NaceSearchTool
 from langchain_nace.types import (
     Answer,
@@ -45,10 +46,12 @@ from langchain_nace.types import (
 
 __all__ = [
     "Answer",
+    "CandidateProfile",
     "Choice",
     "ChoiceAnswer",
     "ClassifierRequest",
     "ClassifierResponse",
+    "ModelSelection",
     "NaceAPIConnectionError",
     "NaceAPIError",
     "NaceAPIResponseValidationError",
@@ -66,6 +69,7 @@ __all__ = [
     "NaceInternalServerError",
     "NaceLowConfidenceError",
     "NaceMediaError",
+    "NaceModelSelector",
     "NaceNotFoundError",
     "NaceOverloadedError",
     "NacePermissionDeniedError",

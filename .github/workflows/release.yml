@@ -12,10 +12,38 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv build
       - name: Install the wheel in a clean venv and import it
+        working-directory: /tmp
         run: |
           uv venv /tmp/smoke --python 3.11
-          uv pip install --python /tmp/smoke dist/*.whl "langchain>=1.4"
-          /tmp/smoke/bin/python -c "from langchain_nace import NaceClassifier, Noul; from langchain_nace.experimental.middleware import NaceAutoModeMiddleware, NaceModelRouterMiddleware"
+          uv pip install --python /tmp/smoke "$GITHUB_WORKSPACE"/dist/*.whl "langchain>=1.4"
+          /tmp/smoke/bin/python - <<'PY'
+          import os
+
+          from langchain_core.messages import HumanMessage
+
+          from langchain_nace import NaceClassifier, NaceModelSelector, Noul
+          from langchain_nace.experimental.middleware import (
+              ModelCandidate,
+              NaceAutoModeMiddleware,
+              NaceModelRouterMiddleware,
+              NaceModelSelectorMiddleware,
+          )
+
+          assert NaceClassifier and Noul and NaceModelSelector
+          assert NaceAutoModeMiddleware and NaceModelRouterMiddleware
+          assert NaceModelSelectorMiddleware and ModelCandidate
+          if os.environ.get("NACE_API_KEY"):
+              selection = NaceModelSelector(
+                  candidates={
+                      "openai/gpt-4o-mini": None,
+                      "anthropic/claude-haiku-5.5": None,
+                  },
+                  timeout=60,
+              ).select([HumanMessage("What is 2 + 2?")])
+              print(selection["model"], selection["reason"], selection["probabilities"])
+              if selection["reason"] != "selected":
+                  raise SystemExit(1)
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: dist

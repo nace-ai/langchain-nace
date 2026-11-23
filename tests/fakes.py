@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import time
@@ -344,3 +345,139 @@ class FakeNdi:
         if route == "job_file":
             return 200, {}, self.full_markdown
         return 404, {}, {"error": {"type": "not_found", "message": f"no fake route for {route}"}}
+
+
+def route_ok(
+    selected: str,
+    probabilities: dict[str, float],
+    *,
+    request_id: str = "req_test",
+) -> Reply:
+    """A 200 route response.
+
+    Probabilities must be floats so the SDK's strict parser accepts them.
+    """
+    return (
+        200,
+        {"x-request-id": request_id},
+        {"selected": selected, "probabilities": probabilities},
+    )
+
+
+def _read_timeout(request: httpx.Request) -> float | None:
+    timeout = request.extensions.get("timeout")
+    if not isinstance(timeout, dict):
+        return None
+    read = timeout.get("read")
+    if isinstance(read, bool) or not isinstance(read, int | float):
+        return None
+    return float(read)
+
+
+def _route_ids(body: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for item in body.get("candidates") or []:
+        if isinstance(item, dict) and isinstance(item.get("id"), str):
+            ids.append(item["id"])
+        elif isinstance(item, str):
+            ids.append(item)
+    return ids or ["fast"]
+
+
+def _default_route(body: dict[str, Any]) -> Reply:
+    ids = _route_ids(body)
+    if len(ids) == 1:
+        probabilities = {ids[0]: 1.0}
+    else:
+        rest = 0.3 / (len(ids) - 1)
+        probabilities = {
+            candidate_id: (0.7 if index == 0 else rest) for index, candidate_id in enumerate(ids)
+        }
+    return route_ok(ids[0], probabilities)
+
+
+@dataclass
+class FakeRoute:
+    """A fake `POST /v1/route`.
+
+    `replies` are used first. `fault` is `"timeout"` or `"connect"`. `delay` sleeps;
+    the sync handler raises `ReadTimeout` without returning a body when `delay` is
+    longer than the request's read timeout, and keeps that body on `withheld`.
+    The async handler awaits, so a deadline or caller cancellation can interrupt it.
+    """
+
+    replies: list[Reply | Callable[[dict[str, Any]], Reply]] = field(default_factory=list)
+    fault: str | None = None
+    delay: float = 0.0
+    requests: list[httpx.Request] = field(default_factory=list)
+    bodies: list[dict[str, Any]] = field(default_factory=list)
+    withheld: list[dict[str, Any]] = field(default_factory=list)
+    in_flight: int = 0
+    delivered: int = 0
+    cancelled: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self)
+
+    def async_transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self._async)
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        body = self._record(request)
+        self._raise_immediate(request, body)
+        if self.delay:
+            time.sleep(self.delay)
+        self.delivered += 1
+        return self._response(body)
+
+    async def _async(self, request: httpx.Request) -> httpx.Response:
+        body = self._record(request)
+        self.in_flight += 1
+        try:
+            if self.fault == "timeout":
+                raise httpx.ReadTimeout("timed out")
+            if self.fault == "connect":
+                raise httpx.ConnectError("failed")
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            self.delivered += 1
+            return self._response(body)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        finally:
+            self.in_flight -= 1
+
+    def _record(self, request: httpx.Request) -> dict[str, Any]:
+        body = json.loads(request.content or b"{}")
+        with self._lock:
+            self.requests.append(request)
+            self.bodies.append(body)
+        return body
+
+    def _raise_immediate(self, request: httpx.Request, body: dict[str, Any]) -> None:
+        if self.fault == "timeout":
+            raise httpx.ReadTimeout("timed out")
+        if self.fault == "connect":
+            raise httpx.ConnectError("failed")
+        read_timeout = _read_timeout(request)
+        if self.delay and read_timeout is not None and self.delay > read_timeout:
+            _status, _headers, payload = _default_route(body)
+            if isinstance(payload, dict):
+                self.withheld.append(payload)
+            raise httpx.ReadTimeout("timed out")
+
+    def _response(self, body: dict[str, Any]) -> httpx.Response:
+        with self._lock:
+            reply = self.replies.pop(0) if self.replies else None
+        if callable(reply):
+            reply = reply(body)
+        if reply is None:
+            status, headers, payload = _default_route(body)
+        else:
+            status, headers, payload = reply
+        headers = {"x-request-id": "req_test", **headers}
+        if payload is None:
+            return httpx.Response(status, headers=headers)
+        return httpx.Response(status, json=payload, headers=headers)

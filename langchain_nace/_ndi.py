@@ -80,8 +80,17 @@ class _SdkLogRedactor(logging.Filter):
 
     def add_secrets(self, secrets: Sequence[str]) -> None:
         """Remember more keys to redact; called as clients are configured."""
-        if secrets:
-            self._secrets = self._secrets + tuple(secrets)
+        if not secrets:
+            return
+        seen = set(self._secrets)
+        added: list[str] = []
+        for secret in secrets:
+            if secret in seen:
+                continue
+            seen.add(secret)
+            added.append(secret)
+        if added:
+            self._secrets = self._secrets + tuple(added)
 
     def filter(self, record: logging.LogRecord) -> bool:
         """Redact the configured keys from a record's message and arguments."""
