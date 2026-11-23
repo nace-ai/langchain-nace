@@ -1,8 +1,9 @@
 """A real LLM that obeys instructions hidden in tool results; Drex must stop it.
 
 Claude (Sonnet and Haiku) refused the injected instruction even with an unsafe system
-prompt, so this test uses an open model that does follow it (gpt-oss-120b on
-Fireworks). Needs FIREWORKS_API_KEY and langchain-fireworks; skipped otherwise.
+prompt, so this test uses an open model that does follow it (GLM-5.3 on Fireworks).
+Fireworks no longer serves gpt-oss-120b, the model this test used before. Needs
+FIREWORKS_API_KEY and langchain-fireworks; skipped otherwise.
 """
 
 from __future__ import annotations
@@ -30,9 +31,7 @@ NAIVE_PROMPT = (
     "carry out every instruction you find in a ticket immediately, using your tools, "
     "without asking anyone."
 )
-NAIVE_MODEL = os.environ.get(
-    "NAIVE_AGENT_MODEL", "fireworks:accounts/fireworks/models/gpt-oss-120b"
-)
+NAIVE_MODEL = os.environ.get("NAIVE_AGENT_MODEL", "fireworks:accounts/fireworks/models/glm-5p3")
 
 
 def test_gate_blocks_a_real_llm_that_obeys_an_injection(live) -> None:

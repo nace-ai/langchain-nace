@@ -246,6 +246,13 @@ def test_default_model_answers_as_drex_max(request_ids) -> None:
         }
     )
     assert classifier.model == "drex-max"
-    assert r.model == "drex-max"
+    # Drex answers a retired id or an alias with a newer version, and the response
+    # reports that version. The catalog names it in `alias_for`.
+    with nace_sdk.NaceClient(
+        api_key=os.environ["NACE_API_KEY_LIVE"],
+        base_url=os.environ.get("NACE_BASE_URL_LIVE") or None,
+    ) as client:
+        catalog = {m.name: m for m in client.models.list().models}
+    assert r.model == (catalog[classifier.model].alias_for or classifier.model)
     assert r.nouls["red"].noul > 0.7
     request_ids.append(("default model + image, no model= given", r.model, r.request_id))
